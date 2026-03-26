@@ -1,0 +1,31 @@
+{
+  "name": "pi-review",
+  "version": "0.1.0",
+  "description": "Code review extension for Pi with ticket compliance (Linear/Jira) and tmux integration",
+  "main": "./src/index.ts",
+  "type": "module",
+  "license": "MIT",
+  "author": "carraes",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/carlosarraes/pi-review.git"
+  },
+  "keywords": [
+    "pi",
+    "review",
+    "code-review",
+    "linear",
+    "jira",
+    "tmux"
+  ],
+  "files": [
+    "src"
+  ],
+  "pi": {
+    "extensions": ["./src"]
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-ai": ">=0.49.0",
+    "@mariozechner/pi-coding-agent": ">=0.49.0"
+  }
+}
