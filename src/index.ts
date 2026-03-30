@@ -1299,6 +1299,7 @@ export default function reviewExtension(pi: ExtensionAPI) {
       return;
     }
 
+    await new Promise((r) => setTimeout(r, 150));
     await pi.exec("tmux", ["send-keys", "-t", claudePane, "Enter"]);
     ctx.ui.notify("Review findings sent to Claude's pane", "info");
   }
