@@ -59,6 +59,8 @@ import {
   Text,
 } from "@mariozechner/pi-tui";
 import { promises as fs } from "node:fs";
+import * as net from "node:net";
+import os from "node:os";
 import path from "node:path";
 
 // State to track fresh session review (where we branched from).
@@ -72,6 +74,7 @@ let reviewTicketComplianceEnabled = false;
 let reviewTicketProvider: "linear" | "jira" = "linear";
 let reviewInferredTicketId: string | undefined = undefined;
 let reviewSendToClaudeEnabled = false;
+let reviewSendToPiEnabled = false;
 
 const REVIEW_STATE_TYPE = "review-session";
 const REVIEW_ANCHOR_TYPE = "review-anchor";
@@ -79,6 +82,11 @@ const REVIEW_SETTINGS_TYPE = "review-settings";
 const REVIEW_LOOP_MAX_ITERATIONS = 10;
 const REVIEW_LOOP_START_TIMEOUT_MS = 15000;
 const REVIEW_LOOP_START_POLL_MS = 50;
+const PI_SESSION_CONTROL_DIR = path.join(
+  os.homedir(),
+  ".pi",
+  "session-control",
+);
 
 type ReviewSessionState = {
   active: boolean;
@@ -90,6 +98,7 @@ type ReviewSettingsState = {
   ticketComplianceEnabled?: boolean;
   ticketProvider?: "linear" | "jira";
   sendToClaudeEnabled?: boolean;
+  sendToPiEnabled?: boolean;
   /** @deprecated Read-only compat for old persisted state */
   linearTicketComplianceEnabled?: boolean;
 };
@@ -170,6 +179,7 @@ function getReviewSettings(ctx: ExtensionContext): ReviewSettingsState {
     ticketComplianceEnabled: state?.ticketComplianceEnabled ?? state?.linearTicketComplianceEnabled,
     ticketProvider: state?.ticketProvider ?? "linear",
     sendToClaudeEnabled: state?.sendToClaudeEnabled,
+    sendToPiEnabled: state?.sendToPiEnabled,
   };
 }
 
@@ -179,6 +189,7 @@ function applyReviewSettings(ctx: ExtensionContext) {
   reviewTicketComplianceEnabled = state.ticketComplianceEnabled === true;
   reviewTicketProvider = state.ticketProvider ?? "linear";
   reviewSendToClaudeEnabled = state.sendToClaudeEnabled === true;
+  reviewSendToPiEnabled = state.sendToPiEnabled === true;
 }
 
 function parseMarkdownHeading(
@@ -1097,11 +1108,13 @@ const REVIEW_PRESETS = [
 const TOGGLE_LOOP_FIXING_VALUE = "toggleLoopFixing" as const;
 const CONFIGURE_TICKET_COMPLIANCE_VALUE = "configureTicketCompliance" as const;
 const TOGGLE_SEND_TO_CLAUDE_VALUE = "toggleSendToClaude" as const;
+const TOGGLE_SEND_TO_PI_VALUE = "toggleSendToPi" as const;
 type ReviewPresetValue =
   | (typeof REVIEW_PRESETS)[number]["value"]
   | typeof TOGGLE_LOOP_FIXING_VALUE
   | typeof CONFIGURE_TICKET_COMPLIANCE_VALUE
-  | typeof TOGGLE_SEND_TO_CLAUDE_VALUE;
+  | typeof TOGGLE_SEND_TO_CLAUDE_VALUE
+  | typeof TOGGLE_SEND_TO_PI_VALUE;
 
 export default function reviewExtension(pi: ExtensionAPI) {
   function persistReviewSettings() {
@@ -1110,6 +1123,7 @@ export default function reviewExtension(pi: ExtensionAPI) {
       ticketComplianceEnabled: reviewTicketComplianceEnabled,
       ticketProvider: reviewTicketProvider,
       sendToClaudeEnabled: reviewSendToClaudeEnabled,
+      sendToPiEnabled: reviewSendToPiEnabled,
     });
   }
 
@@ -1130,6 +1144,13 @@ export default function reviewExtension(pi: ExtensionAPI) {
 
   function setSendToClaudeEnabled(enabled: boolean) {
     reviewSendToClaudeEnabled = enabled;
+    if (enabled) reviewSendToPiEnabled = false;
+    persistReviewSettings();
+  }
+
+  function setSendToPiEnabled(enabled: boolean) {
+    reviewSendToPiEnabled = enabled;
+    if (enabled) reviewSendToClaudeEnabled = false;
     persistReviewSettings();
   }
 
@@ -1315,8 +1336,85 @@ export default function reviewExtension(pi: ExtensionAPI) {
     ctx.ui.notify("Review findings sent to Claude's pane", "info");
   }
 
+  async function findTargetPiSocket(): Promise<string | null> {
+    const ownSessionId = process.env.PI_SESSION_ID;
+    try {
+      const entries = await fs.readdir(PI_SESSION_CONTROL_DIR);
+      for (const entry of entries) {
+        if (!entry.endsWith(".sock")) continue;
+        const sessionId = entry.replace(/\.sock$/, "");
+        if (sessionId === ownSessionId) continue;
+        return path.join(PI_SESSION_CONTROL_DIR, entry);
+      }
+    } catch {
+      // Directory doesn't exist or not readable
+    }
+    return null;
+  }
+
+  async function sendFindingsToPi(
+    text: string,
+    ctx: ExtensionContext,
+  ): Promise<void> {
+    const socketPath = await findTargetPiSocket();
+    if (!socketPath) {
+      ctx.ui.notify(
+        "No target Pi session found in ~/.pi/session-control/",
+        "warning",
+      );
+      return;
+    }
+
+    const rpcPayload =
+      JSON.stringify({
+        type: "send",
+        message: `[pi-review findings]\n${text}`,
+        mode: "follow_up",
+      }) + "\n";
+
+    return new Promise<void>((resolve) => {
+      const socket = net.createConnection(socketPath, () => {
+        socket.write(rpcPayload);
+      });
+
+      let buffer = "";
+      socket.on("data", (chunk) => {
+        buffer += chunk.toString();
+        const newlineIdx = buffer.indexOf("\n");
+        if (newlineIdx === -1) return;
+        try {
+          const resp = JSON.parse(buffer.slice(0, newlineIdx));
+          if (resp.success) {
+            ctx.ui.notify("Review findings sent to Pi session", "info");
+          } else {
+            ctx.ui.notify(
+              `Failed to send findings to Pi: ${resp.error ?? "unknown"}`,
+              "warning",
+            );
+          }
+        } catch {
+          ctx.ui.notify("Invalid response from Pi session socket", "warning");
+        }
+        socket.destroy();
+        resolve();
+      });
+
+      socket.on("error", (err) => {
+        ctx.ui.notify(`Pi session socket error: ${err.message}`, "warning");
+        resolve();
+      });
+
+      socket.setTimeout(5000, () => {
+        ctx.ui.notify("Pi session socket timed out", "warning");
+        socket.destroy();
+        resolve();
+      });
+    });
+  }
+
   pi.on("turn_end", async (event, ctx) => {
-    if (!reviewSendToClaudeEnabled || !reviewOriginId) return;
+    if ((!reviewSendToClaudeEnabled && !reviewSendToPiEnabled) || !reviewOriginId)
+      return;
 
     const assistantMsg = event.message;
     if (assistantMsg.role !== "assistant") return;
@@ -1329,7 +1427,11 @@ export default function reviewExtension(pi: ExtensionAPI) {
     // Only send if it looks like review findings (has a verdict line)
     if (!/verdict\s*:/i.test(text)) return;
 
-    await sendFindingsToClaude(text, ctx);
+    if (reviewSendToClaudeEnabled) {
+      await sendFindingsToClaude(text, ctx);
+    } else if (reviewSendToPiEnabled) {
+      await sendFindingsToPi(text, ctx);
+    }
   });
 
   /**
@@ -1398,6 +1500,12 @@ export default function reviewExtension(pi: ExtensionAPI) {
       const sendToClaudeDescription = reviewSendToClaudeEnabled
         ? "(currently on)"
         : "(currently off)";
+      const sendToPiLabel = reviewSendToPiEnabled
+        ? "Disable send to Pi (session-control)"
+        : "Enable send to Pi (session-control)";
+      const sendToPiDescription = reviewSendToPiEnabled
+        ? "(currently on)"
+        : "(currently off)";
       const items: SelectItem[] = [
         ...presetItems,
         {
@@ -1414,6 +1522,11 @@ export default function reviewExtension(pi: ExtensionAPI) {
           value: TOGGLE_SEND_TO_CLAUDE_VALUE,
           label: sendToClaudeLabel,
           description: sendToClaudeDescription,
+        },
+        {
+          value: TOGGLE_SEND_TO_PI_VALUE,
+          label: sendToPiLabel,
+          description: sendToPiDescription,
         },
       ];
 
@@ -1492,6 +1605,18 @@ export default function reviewExtension(pi: ExtensionAPI) {
           nextEnabled
             ? "Send to Claude enabled (findings will be pasted to Claude's tmux pane)"
             : "Send to Claude disabled",
+          "info",
+        );
+        continue;
+      }
+
+      if (result === TOGGLE_SEND_TO_PI_VALUE) {
+        const nextEnabled = !reviewSendToPiEnabled;
+        setSendToPiEnabled(nextEnabled);
+        ctx.ui.notify(
+          nextEnabled
+            ? "Send to Pi enabled (findings will be sent via session-control socket)"
+            : "Send to Pi disabled",
           "info",
         );
         continue;
