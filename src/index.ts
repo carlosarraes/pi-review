@@ -1219,18 +1219,8 @@ export default function reviewExtension(pi: ExtensionAPI) {
 
   async function getClaudePane(): Promise<string | null> {
     const muxDir = await getMuxDir();
-    // Try config.json first
-    const { stdout: configRaw, code: configCode } = await pi.exec("cat", [
-      `${muxDir}/config.json`,
-    ]);
-    if (configCode === 0 && configRaw.trim()) {
-      try {
-        const config = JSON.parse(configRaw.trim());
-        if (config.claudePane) return config.claudePane;
-      } catch {}
-    }
 
-    // Auto-detect: smallest pane_top = Claude (top pane)
+    // Get live pane list (needed for both cache validation and auto-detect)
     const { stdout: paneList, code: paneCode } = await pi.exec("tmux", [
       "list-panes",
       "-F",
@@ -1250,6 +1240,21 @@ export default function reviewExtension(pi: ExtensionAPI) {
 
     if (panes.length < 2) return null;
 
+    const livePaneIds = new Set(panes.map((p) => p.id));
+
+    // Try config.json, but only if the cached pane still exists
+    const { stdout: configRaw, code: configCode } = await pi.exec("cat", [
+      `${muxDir}/config.json`,
+    ]);
+    if (configCode === 0 && configRaw.trim()) {
+      try {
+        const config = JSON.parse(configRaw.trim());
+        if (config.claudePane && livePaneIds.has(config.claudePane))
+          return config.claudePane;
+      } catch {}
+    }
+
+    // Auto-detect: smallest pane_top = Claude (top pane)
     const claudePane = panes[0].id;
 
     // Save config for next time
@@ -1280,22 +1285,28 @@ export default function reviewExtension(pi: ExtensionAPI) {
     await fs.mkdir(muxDir, { recursive: true });
     await fs.writeFile(bufferPath, `[pi-review findings]\n${text}`, "utf8");
 
-    const { code: loadCode } = await pi.exec("tmux", [
+    const { code: loadCode, stderr: loadErr } = await pi.exec("tmux", [
       "load-buffer",
       bufferPath,
     ]);
     if (loadCode !== 0) {
-      ctx.ui.notify("Failed to load review into tmux buffer", "warning");
+      ctx.ui.notify(
+        `Failed to load review into tmux buffer: ${loadErr}`,
+        "warning",
+      );
       return;
     }
 
-    const { code: pasteCode } = await pi.exec("tmux", [
+    const { code: pasteCode, stderr: pasteErr } = await pi.exec("tmux", [
       "paste-buffer",
       "-t",
       claudePane,
     ]);
     if (pasteCode !== 0) {
-      ctx.ui.notify("Failed to paste review to Claude's pane", "warning");
+      ctx.ui.notify(
+        `Failed to paste review to Claude's pane (${claudePane}): ${pasteErr}`,
+        "warning",
+      );
       return;
     }
 
