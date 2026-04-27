@@ -103,6 +103,39 @@ type ReviewSettingsState = {
   linearTicketComplianceEnabled?: boolean;
 };
 
+// Global persistence — survives all session boundaries (fork, navigateTree,
+// resume, restart). Per-session entry persistence is unreliable because /review
+// may navigate to a sibling branch where the entry isn't visible (post-Apr 3
+// pi-mono refactor). Session entry remains as override (session > global).
+const PI_REVIEW_STATE_DIR = path.join(os.homedir(), ".pi-review");
+const PI_REVIEW_STATE_FILE = path.join(PI_REVIEW_STATE_DIR, "state.json");
+
+const debugLog = (msg: string) => {
+  if (process.env.PI_REVIEW_DEBUG === "1") {
+    process.stderr.write(`[pi-review] ${msg}\n`);
+  }
+};
+
+async function loadGlobalSettings(): Promise<ReviewSettingsState> {
+  try {
+    const raw = await fs.readFile(PI_REVIEW_STATE_FILE, "utf8");
+    return JSON.parse(raw) as ReviewSettingsState;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+      debugLog(`loadGlobalSettings failed: ${err}`);
+    }
+    return {};
+  }
+}
+
+// Atomic write (tmp + rename) so concurrent Pi instances can't tear the file.
+async function saveGlobalSettings(state: ReviewSettingsState): Promise<void> {
+  await fs.mkdir(PI_REVIEW_STATE_DIR, { recursive: true });
+  const tmp = PI_REVIEW_STATE_FILE + ".tmp";
+  await fs.writeFile(tmp, JSON.stringify(state, null, 2), "utf8");
+  await fs.rename(tmp, PI_REVIEW_STATE_FILE);
+}
+
 function setReviewWidget(ctx: ExtensionContext, active: boolean) {
   if (!ctx.hasUI) return;
   if (!active) {
@@ -166,30 +199,48 @@ function applyReviewState(ctx: ExtensionContext) {
   setReviewWidget(ctx, false);
 }
 
-function getReviewSettings(ctx: ExtensionContext): ReviewSettingsState {
-  let state: ReviewSettingsState | undefined;
+async function getReviewSettings(
+  ctx: ExtensionContext,
+): Promise<ReviewSettingsState> {
+  const global = await loadGlobalSettings();
+
+  let session: ReviewSettingsState | undefined;
   for (const entry of ctx.sessionManager.getEntries()) {
     if (entry.type === "custom" && entry.customType === REVIEW_SETTINGS_TYPE) {
-      state = entry.data as ReviewSettingsState | undefined;
+      session = entry.data as ReviewSettingsState | undefined;
     }
   }
 
+  debugLog(
+    `getReviewSettings: sessionEntry=${session ? "present" : "absent"} ` +
+      `globalSendClaude=${global.sendToClaudeEnabled} sessionSendClaude=${session?.sendToClaudeEnabled}`,
+  );
+
+  // Session entry overrides global file (session > global > defaults).
   return {
-    loopFixingEnabled: state?.loopFixingEnabled,
-    ticketComplianceEnabled: state?.ticketComplianceEnabled ?? state?.linearTicketComplianceEnabled,
-    ticketProvider: state?.ticketProvider ?? "linear",
-    sendToClaudeEnabled: state?.sendToClaudeEnabled,
-    sendToPiEnabled: state?.sendToPiEnabled,
+    loopFixingEnabled: session?.loopFixingEnabled ?? global.loopFixingEnabled,
+    ticketComplianceEnabled:
+      session?.ticketComplianceEnabled ??
+      session?.linearTicketComplianceEnabled ??
+      global.ticketComplianceEnabled ??
+      global.linearTicketComplianceEnabled,
+    ticketProvider: session?.ticketProvider ?? global.ticketProvider ?? "linear",
+    sendToClaudeEnabled: session?.sendToClaudeEnabled ?? global.sendToClaudeEnabled,
+    sendToPiEnabled: session?.sendToPiEnabled ?? global.sendToPiEnabled,
   };
 }
 
-function applyReviewSettings(ctx: ExtensionContext) {
-  const state = getReviewSettings(ctx);
+async function applyReviewSettings(ctx: ExtensionContext) {
+  const state = await getReviewSettings(ctx);
   reviewLoopFixingEnabled = state.loopFixingEnabled === true;
   reviewTicketComplianceEnabled = state.ticketComplianceEnabled === true;
   reviewTicketProvider = state.ticketProvider ?? "linear";
   reviewSendToClaudeEnabled = state.sendToClaudeEnabled === true;
   reviewSendToPiEnabled = state.sendToPiEnabled === true;
+  debugLog(
+    `applyReviewSettings result: sendClaude=${reviewSendToClaudeEnabled} ` +
+      `sendPi=${reviewSendToPiEnabled} originId=${reviewOriginId ?? "none"}`,
+  );
 }
 
 function parseMarkdownHeading(
@@ -1118,12 +1169,20 @@ type ReviewPresetValue =
 
 export default function reviewExtension(pi: ExtensionAPI) {
   function persistReviewSettings() {
-    pi.appendEntry(REVIEW_SETTINGS_TYPE, {
+    const snapshot: ReviewSettingsState = {
       loopFixingEnabled: reviewLoopFixingEnabled,
       ticketComplianceEnabled: reviewTicketComplianceEnabled,
       ticketProvider: reviewTicketProvider,
       sendToClaudeEnabled: reviewSendToClaudeEnabled,
       sendToPiEnabled: reviewSendToPiEnabled,
+    };
+    pi.appendEntry(REVIEW_SETTINGS_TYPE, snapshot);
+    // Fire-and-forget global save. Survives any session boundary that the
+    // per-session entry doesn't (fork, navigateTree, resume, restart).
+    saveGlobalSettings(snapshot).catch((err) => {
+      debugLog(
+        `saveGlobalSettings failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
     });
   }
 
@@ -1145,12 +1204,14 @@ export default function reviewExtension(pi: ExtensionAPI) {
   function setSendToClaudeEnabled(enabled: boolean) {
     reviewSendToClaudeEnabled = enabled;
     if (enabled) reviewSendToPiEnabled = false;
+    debugLog(`setSendToClaudeEnabled(${enabled})`);
     persistReviewSettings();
   }
 
   function setSendToPiEnabled(enabled: boolean) {
     reviewSendToPiEnabled = enabled;
     if (enabled) reviewSendToClaudeEnabled = false;
+    debugLog(`setSendToPiEnabled(${enabled})`);
     persistReviewSettings();
   }
 
@@ -1165,8 +1226,8 @@ export default function reviewExtension(pi: ExtensionAPI) {
   }
 
   async function applyAllReviewState(ctx: ExtensionContext) {
-    const settings = getReviewSettings(ctx);
-    applyReviewSettings(ctx);
+    const settings = await getReviewSettings(ctx);
+    await applyReviewSettings(ctx);
     applyReviewState(ctx);
     const inferredId = await refreshInferredTicket(ctx);
 
@@ -1217,15 +1278,16 @@ export default function reviewExtension(pi: ExtensionAPI) {
     );
   }
 
-  pi.on("session_start", async (_event, ctx) => {
-    await applyAllReviewState(ctx);
-  });
-
-  pi.on("session_switch", async (_event, ctx) => {
+  // session_start now covers the old session_switch / session_fork events too,
+  // distinguished by event.reason ("startup" | "reload" | "new" | "resume" | "fork").
+  // pi-mono refactor 9f9277cc (Apr 3 2026) consolidated those events.
+  pi.on("session_start", async (event, ctx) => {
+    debugLog(`event session_start reason=${event.reason}`);
     await applyAllReviewState(ctx);
   });
 
   pi.on("session_tree", async (_event, ctx) => {
+    debugLog(`event session_tree`);
     await applyAllReviewState(ctx);
   });
 
@@ -1413,19 +1475,26 @@ export default function reviewExtension(pi: ExtensionAPI) {
   }
 
   pi.on("turn_end", async (event, ctx) => {
+    const assistantMsg = event.message;
+    const isAssistant = assistantMsg.role === "assistant";
+    const text = isAssistant
+      ? extractAssistantTextContent(
+          (assistantMsg as { content?: unknown }).content,
+        )
+      : "";
+    const hasVerdict = !!text && /verdict\s*:/i.test(text);
+
+    debugLog(
+      `turn_end: sendClaude=${reviewSendToClaudeEnabled} sendPi=${reviewSendToPiEnabled} ` +
+        `originId=${reviewOriginId ?? "none"} role=${assistantMsg.role} ` +
+        `textLen=${text?.length ?? 0} hasVerdict=${hasVerdict}`,
+    );
+
     if ((!reviewSendToClaudeEnabled && !reviewSendToPiEnabled) || !reviewOriginId)
       return;
-
-    const assistantMsg = event.message;
-    if (assistantMsg.role !== "assistant") return;
-
-    const text = extractAssistantTextContent(
-      (assistantMsg as { content?: unknown }).content,
-    );
+    if (!isAssistant) return;
     if (!text) return;
-
-    // Only send if it looks like review findings (has a verdict line)
-    if (!/verdict\s*:/i.test(text)) return;
+    if (!hasVerdict) return;
 
     if (reviewSendToClaudeEnabled) {
       await sendFindingsToClaude(text, ctx);
