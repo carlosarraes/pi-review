@@ -58,7 +58,7 @@ import {
   Spacer,
   Text,
 } from "@mariozechner/pi-tui";
-import { promises as fs } from "node:fs";
+import { promises as fs, appendFileSync } from "node:fs";
 import * as net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -109,10 +109,18 @@ type ReviewSettingsState = {
 // pi-mono refactor). Session entry remains as override (session > global).
 const PI_REVIEW_STATE_DIR = path.join(os.homedir(), ".pi-review");
 const PI_REVIEW_STATE_FILE = path.join(PI_REVIEW_STATE_DIR, "state.json");
+const PI_REVIEW_DEBUG_LOG = path.join(PI_REVIEW_STATE_DIR, "debug.log");
 
+// Pi's TUI suppresses raw stderr; write to a file so logs survive regardless of UI state.
+// The dir is created lazily by saveGlobalSettings on first toggle; until then, appendFileSync
+// will throw ENOENT and we silently drop the message.
 const debugLog = (msg: string) => {
-  if (process.env.PI_REVIEW_DEBUG === "1") {
-    process.stderr.write(`[pi-review] ${msg}\n`);
+  if (process.env.PI_REVIEW_DEBUG !== "1") return;
+  const line = `[${new Date().toISOString()}] ${msg}\n`;
+  try {
+    appendFileSync(PI_REVIEW_DEBUG_LOG, line, "utf8");
+  } catch {
+    // best-effort: dir may not exist yet, or disk is full — don't crash the extension
   }
 };
 
