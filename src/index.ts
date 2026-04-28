@@ -459,6 +459,17 @@ function hasNeedsAttentionVerdict(messageText: string): boolean {
   return false;
 }
 
+// Generic "this turn looks like the end-of-review verdict line" detector. Used as a
+// gate before sending findings out to tmux/socket, so it must accept the markdown
+// variants the LLM stochastically produces (`**Verdict**:`, `## Verdict`, etc.) —
+// the simpler `/verdict\s*:/i` missed those and silently dropped real reviews.
+function hasReviewVerdict(text: string): boolean {
+  const cleaned = text.replace(/[*_`]/g, "");
+  if (/(?:^|\n)\s*(?:[-+]\s+)?(?:overall\s+)?verdict\s*:/i.test(cleaned)) return true;
+  if (/(?:^|\n)\s*#{1,6}\s+(?:overall\s+)?verdict\b/i.test(cleaned)) return true;
+  return false;
+}
+
 function hasBlockingReviewFindings(messageText: string): boolean {
   const lines = messageText.split(/\r?\n/);
   const bounds = getFindingsSectionBounds(lines);
@@ -1490,12 +1501,17 @@ export default function reviewExtension(pi: ExtensionAPI) {
           (assistantMsg as { content?: unknown }).content,
         )
       : "";
-    const hasVerdict = !!text && /verdict\s*:/i.test(text);
+    const hasVerdict = !!text && hasReviewVerdict(text);
 
     debugLog(
       `turn_end: sendClaude=${reviewSendToClaudeEnabled} sendPi=${reviewSendToPiEnabled} ` +
         `originId=${reviewOriginId ?? "none"} role=${assistantMsg.role} ` +
-        `textLen=${text?.length ?? 0} hasVerdict=${hasVerdict}`,
+        `textLen=${text?.length ?? 0} hasVerdict=${hasVerdict}` +
+        // When text is present but verdict missed, log the tail so we can see
+        // what format the LLM actually produced and refine the regex if needed.
+        (text && !hasVerdict
+          ? ` tail=${JSON.stringify(text.slice(-300))}`
+          : ""),
     );
 
     if ((!reviewSendToClaudeEnabled && !reviewSendToPiEnabled) || !reviewOriginId)
