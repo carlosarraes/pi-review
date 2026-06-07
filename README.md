@@ -19,7 +19,7 @@ Based on the original [review extension](https://github.com/mitsuhiko/agent-stuf
 pi install git:github.com/carlosarraes/pi-review
 ```
 
-Requires `@mariozechner/pi-ai` and `@mariozechner/pi-coding-agent` >= 0.49.0.
+Requires `@earendil-works/pi-ai` and `@earendil-works/pi-coding-agent` >= 0.49.0.
 
 ## Usage
 
