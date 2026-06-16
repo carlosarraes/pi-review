@@ -1044,7 +1044,17 @@ async function createWorktreeTarget(
     createdAt: new Date().toISOString(),
   });
 
-  const mergeBaseSha = await getMergeBaseBetween(pi, opts.sha, opts.baseBranch);
+  // The base branch may exist only on the remote (common for PRs reviewed in a
+  // repo without a local checkout of the base). Fall back to origin/<base> so
+  // the merge base is pre-computed rather than deferred to the model.
+  let mergeBaseSha = await getMergeBaseBetween(pi, opts.sha, opts.baseBranch);
+  if (!mergeBaseSha && !opts.baseBranch.includes("/")) {
+    mergeBaseSha = await getMergeBaseBetween(
+      pi,
+      opts.sha,
+      `origin/${opts.baseBranch}`,
+    );
+  }
 
   return {
     ok: true,
