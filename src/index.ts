@@ -67,8 +67,6 @@ import path from "node:path";
 // This is intentional - the UI and /end-review command assume a single active review.
 let reviewOriginId: string | undefined = undefined;
 let endReviewInProgress = false;
-let reviewLoopFixingEnabled = false;
-let reviewLoopInProgress = false;
 let reviewTicketComplianceEnabled = false;
 let reviewTicketProvider: "linear" | "jira" = "linear";
 let reviewInferredTicketId: string | undefined = undefined;
@@ -78,9 +76,6 @@ let reviewSendToPiEnabled = false;
 const REVIEW_STATE_TYPE = "review-session";
 const REVIEW_ANCHOR_TYPE = "review-anchor";
 const REVIEW_SETTINGS_TYPE = "review-settings";
-const REVIEW_LOOP_MAX_ITERATIONS = 10;
-const REVIEW_LOOP_START_TIMEOUT_MS = 15000;
-const REVIEW_LOOP_START_POLL_MS = 50;
 const PI_SESSION_CONTROL_DIR = path.join(
   os.homedir(),
   ".pi",
@@ -93,7 +88,6 @@ type ReviewSessionState = {
 };
 
 type ReviewSettingsState = {
-  loopFixingEnabled?: boolean;
   ticketComplianceEnabled?: boolean;
   ticketProvider?: "linear" | "jira";
   sendToClaudeEnabled?: boolean;
@@ -220,15 +214,7 @@ function setReviewWidget(ctx: ExtensionContext, active: boolean) {
         : reviewTicketComplianceEnabled
           ? `${providerName} ticket compliance enabled`
           : undefined;
-    const details = reviewLoopInProgress
-      ? ["loop fixing running", ticketLabel].filter(Boolean)
-      : reviewLoopFixingEnabled
-        ? [
-            "loop fixing enabled",
-            ticketLabel,
-            "return with /end-review",
-          ].filter(Boolean)
-        : [ticketLabel, "return with /end-review"].filter(Boolean);
+    const details = [ticketLabel, "return with /end-review"].filter(Boolean);
     const message = details.length
       ? `Review session active (${details.join(", ")})`
       : "Review session active";
@@ -287,7 +273,6 @@ async function getReviewSettings(
 
   // Session entry overrides global file (session > global > defaults).
   return {
-    loopFixingEnabled: session?.loopFixingEnabled ?? global.loopFixingEnabled,
     ticketComplianceEnabled:
       session?.ticketComplianceEnabled ??
       session?.linearTicketComplianceEnabled ??
@@ -301,7 +286,6 @@ async function getReviewSettings(
 
 async function applyReviewSettings(ctx: ExtensionContext) {
   const state = await getReviewSettings(ctx);
-  reviewLoopFixingEnabled = state.loopFixingEnabled === true;
   reviewTicketComplianceEnabled = state.ticketComplianceEnabled === true;
   reviewTicketProvider = state.ticketProvider ?? "linear";
   reviewSendToClaudeEnabled = state.sendToClaudeEnabled === true;
@@ -310,214 +294,6 @@ async function applyReviewSettings(ctx: ExtensionContext) {
     `applyReviewSettings result: sendClaude=${reviewSendToClaudeEnabled} ` +
       `sendPi=${reviewSendToPiEnabled} originId=${reviewOriginId ?? "none"}`,
   );
-}
-
-function parseMarkdownHeading(
-  line: string,
-): { level: number; title: string } | null {
-  const headingMatch = line.match(/^\s*(#{1,6})\s+(.+?)\s*$/);
-  if (!headingMatch) {
-    return null;
-  }
-
-  const rawTitle = headingMatch[2].replace(/\s+#+\s*$/, "").trim();
-  return {
-    level: headingMatch[1].length,
-    title: rawTitle,
-  };
-}
-
-function getFindingsSectionBounds(
-  lines: string[],
-): { start: number; end: number } | null {
-  let start = -1;
-  let findingsHeadingLevel: number | null = null;
-
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    const heading = parseMarkdownHeading(line);
-    if (heading && /^findings\b/i.test(heading.title)) {
-      start = i + 1;
-      findingsHeadingLevel = heading.level;
-      break;
-    }
-    if (/^\s*findings\s*:?\s*$/i.test(line)) {
-      start = i + 1;
-      break;
-    }
-  }
-
-  if (start < 0) {
-    return null;
-  }
-
-  let end = lines.length;
-  for (let i = start; i < lines.length; i++) {
-    const line = lines[i];
-    const heading = parseMarkdownHeading(line);
-    if (heading) {
-      const normalizedTitle = heading.title.replace(/[*_`]/g, "").trim();
-      if (
-        /^(review scope|verdict|overall verdict|fix queue|constraints(?:\s*&\s*preferences)?)\b:?/i.test(
-          normalizedTitle,
-        )
-      ) {
-        end = i;
-        break;
-      }
-
-      if (/\[P[0-4]\]/i.test(heading.title)) {
-        continue;
-      }
-
-      if (
-        findingsHeadingLevel !== null &&
-        heading.level <= findingsHeadingLevel
-      ) {
-        end = i;
-        break;
-      }
-    }
-
-    if (
-      /^\s*(review scope|verdict|overall verdict|fix queue|constraints(?:\s*&\s*preferences)?)\b:?/i.test(
-        line,
-      )
-    ) {
-      end = i;
-      break;
-    }
-  }
-
-  return { start, end };
-}
-
-function isLikelyFindingLine(line: string): boolean {
-  if (!/\[P[0-4]\]/i.test(line)) {
-    return false;
-  }
-
-  if (/^\s*(?:[-*+]|(?:\d+)[.)]|#{1,6})\s+priority\s+tag\b/i.test(line)) {
-    return false;
-  }
-
-  if (
-    /^\s*(?:[-*+]|(?:\d+)[.)]|#{1,6})\s+\[P[0-4]\]\s*-\s*(?:drop everything|urgent|normal|low|nice to have|pattern\/best-practice)\b/i.test(
-      line,
-    )
-  ) {
-    return false;
-  }
-
-  const allPriorityTags = line.match(/\[P[0-4]\]/gi) ?? [];
-  if (allPriorityTags.length > 1) {
-    return false;
-  }
-
-  if (/^\s*(?:[-*+]|(?:\d+)[.)])\s+/.test(line)) {
-    return true;
-  }
-
-  if (/^\s*#{1,6}\s+/.test(line)) {
-    return true;
-  }
-
-  if (/^\s*(?:\*\*|__)?\[P[0-4]\](?:\*\*|__)?(?=\s|:|-)/i.test(line)) {
-    return true;
-  }
-
-  return false;
-}
-
-function normalizeVerdictValue(value: string): string {
-  return value
-    .trim()
-    .replace(/^[-*+]\s*/, "")
-    .replace(/^['"`]+|['"`]+$/g, "")
-    .toLowerCase();
-}
-
-function isNeedsAttentionVerdictValue(value: string): boolean {
-  const normalized = normalizeVerdictValue(value);
-  if (!normalized.includes("needs attention")) {
-    return false;
-  }
-
-  if (/\bnot\s+needs\s+attention\b/.test(normalized)) {
-    return false;
-  }
-
-  // Reject rubric/choice phrasing like "correct or needs attention", but
-  // keep legitimate verdict text that may contain unrelated "or".
-  if (/\bcorrect\b/.test(normalized) && /\bor\b/.test(normalized)) {
-    return false;
-  }
-
-  return true;
-}
-
-function hasNeedsAttentionVerdict(messageText: string): boolean {
-  const lines = messageText.split(/\r?\n/);
-
-  for (const line of lines) {
-    const inlineMatch = line.match(
-      /^\s*(?:[*-+]\s*)?(?:overall\s+)?verdict\s*:\s*(.+)$/i,
-    );
-    if (inlineMatch && isNeedsAttentionVerdictValue(inlineMatch[1])) {
-      return true;
-    }
-  }
-
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    const heading = parseMarkdownHeading(line);
-
-    let verdictLevel: number | null = null;
-    if (heading) {
-      const normalizedHeading = heading.title.replace(/[*_`]/g, "").trim();
-      if (!/^(?:overall\s+)?verdict\b/i.test(normalizedHeading)) {
-        continue;
-      }
-      verdictLevel = heading.level;
-    } else if (!/^\s*(?:overall\s+)?verdict\s*:?\s*$/i.test(line)) {
-      continue;
-    }
-
-    for (let j = i + 1; j < lines.length; j++) {
-      const verdictLine = lines[j];
-      const nextHeading = parseMarkdownHeading(verdictLine);
-      if (nextHeading) {
-        const normalizedNextHeading = nextHeading.title
-          .replace(/[*_`]/g, "")
-          .trim();
-        if (verdictLevel === null || nextHeading.level <= verdictLevel) {
-          break;
-        }
-        if (
-          /^(review scope|findings|fix queue|constraints(?:\s*&\s*preferences)?)\b:?/i.test(
-            normalizedNextHeading,
-          )
-        ) {
-          break;
-        }
-      }
-
-      const trimmed = verdictLine.trim();
-      if (!trimmed) {
-        continue;
-      }
-
-      if (isNeedsAttentionVerdictValue(trimmed)) {
-        return true;
-      }
-
-      if (/\bcorrect\b/i.test(normalizeVerdictValue(trimmed))) {
-        break;
-      }
-    }
-  }
-
-  return false;
 }
 
 // Generic "this turn looks like the end-of-review verdict line" detector. Used as a
@@ -529,39 +305,6 @@ function hasReviewVerdict(text: string): boolean {
   if (/(?:^|\n)\s*(?:[-+]\s+)?(?:overall\s+)?verdict\s*:/i.test(cleaned)) return true;
   if (/(?:^|\n)\s*#{1,6}\s+(?:overall\s+)?verdict\b/i.test(cleaned)) return true;
   return false;
-}
-
-function hasBlockingReviewFindings(messageText: string): boolean {
-  const lines = messageText.split(/\r?\n/);
-  const bounds = getFindingsSectionBounds(lines);
-  const candidateLines = bounds ? lines.slice(bounds.start, bounds.end) : lines;
-
-  let inCodeFence = false;
-  let foundTaggedFinding = false;
-  for (const line of candidateLines) {
-    if (/^\s*```/.test(line)) {
-      inCodeFence = !inCodeFence;
-      continue;
-    }
-    if (inCodeFence) {
-      continue;
-    }
-
-    if (!isLikelyFindingLine(line)) {
-      continue;
-    }
-
-    foundTaggedFinding = true;
-    if (/\[(P0|P1|P2)\]/i.test(line)) {
-      return true;
-    }
-  }
-
-  if (foundTaggedFinding) {
-    return false;
-  }
-
-  return hasNeedsAttentionVerdict(messageText);
 }
 
 // Review target types (matching Codex's approach)
@@ -1285,12 +1028,6 @@ function getUserFacingHint(target: ReviewTarget): string {
   }
 }
 
-type AssistantSnapshot = {
-  id: string;
-  text: string;
-  stopReason?: string;
-};
-
 function extractAssistantTextContent(content: unknown): string {
   if (typeof content === "string") {
     return content.trim();
@@ -1314,55 +1051,6 @@ function extractAssistantTextContent(content: unknown): string {
   return textParts.join("\n").trim();
 }
 
-function getLastAssistantSnapshot(
-  ctx: ExtensionContext,
-): AssistantSnapshot | null {
-  const entries = ctx.sessionManager.getBranch();
-  for (let i = entries.length - 1; i >= 0; i--) {
-    const entry = entries[i];
-    if (entry.type !== "message" || entry.message.role !== "assistant") {
-      continue;
-    }
-
-    const assistantMessage = entry.message as {
-      content?: unknown;
-      stopReason?: string;
-    };
-    return {
-      id: entry.id,
-      text: extractAssistantTextContent(assistantMessage.content),
-      stopReason: assistantMessage.stopReason,
-    };
-  }
-
-  return null;
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function waitForLoopTurnToStart(
-  ctx: ExtensionContext,
-  previousAssistantId?: string,
-): Promise<boolean> {
-  const deadline = Date.now() + REVIEW_LOOP_START_TIMEOUT_MS;
-
-  while (Date.now() < deadline) {
-    const lastAssistantId = getLastAssistantSnapshot(ctx)?.id;
-    if (
-      !ctx.isIdle() ||
-      ctx.hasPendingMessages() ||
-      (lastAssistantId && lastAssistantId !== previousAssistantId)
-    ) {
-      return true;
-    }
-    await sleep(REVIEW_LOOP_START_POLL_MS);
-  }
-
-  return false;
-}
-
 // Review preset options for the selector (keep this order stable)
 const REVIEW_PRESETS = [
   {
@@ -1382,13 +1070,11 @@ const REVIEW_PRESETS = [
   },
 ] as const;
 
-const TOGGLE_LOOP_FIXING_VALUE = "toggleLoopFixing" as const;
 const CONFIGURE_TICKET_COMPLIANCE_VALUE = "configureTicketCompliance" as const;
 const TOGGLE_SEND_TO_CLAUDE_VALUE = "toggleSendToClaude" as const;
 const TOGGLE_SEND_TO_PI_VALUE = "toggleSendToPi" as const;
 type ReviewPresetValue =
   | (typeof REVIEW_PRESETS)[number]["value"]
-  | typeof TOGGLE_LOOP_FIXING_VALUE
   | typeof CONFIGURE_TICKET_COMPLIANCE_VALUE
   | typeof TOGGLE_SEND_TO_CLAUDE_VALUE
   | typeof TOGGLE_SEND_TO_PI_VALUE;
@@ -1396,7 +1082,6 @@ type ReviewPresetValue =
 export default function reviewExtension(pi: ExtensionAPI) {
   function persistReviewSettings() {
     const snapshot: ReviewSettingsState = {
-      loopFixingEnabled: reviewLoopFixingEnabled,
       ticketComplianceEnabled: reviewTicketComplianceEnabled,
       ticketProvider: reviewTicketProvider,
       sendToClaudeEnabled: reviewSendToClaudeEnabled,
@@ -1410,11 +1095,6 @@ export default function reviewExtension(pi: ExtensionAPI) {
         `saveGlobalSettings failed: ${err instanceof Error ? err.message : String(err)}`,
       );
     });
-  }
-
-  function setReviewLoopFixingEnabled(enabled: boolean) {
-    reviewLoopFixingEnabled = enabled;
-    persistReviewSettings();
   }
 
   function setTicketComplianceEnabled(enabled: boolean) {
@@ -1775,12 +1455,6 @@ export default function reviewExtension(pi: ExtensionAPI) {
     while (true) {
       const inferredId = await refreshInferredTicket();
       const providerName = reviewTicketProvider === "jira" ? "Jira" : "Linear";
-      const loopToggleLabel = reviewLoopFixingEnabled
-        ? "Disable Loop Fixing"
-        : "Enable Loop Fixing";
-      const loopToggleDescription = reviewLoopFixingEnabled
-        ? "(currently on)"
-        : "(currently off)";
       const ticketToggleLabel = reviewTicketComplianceEnabled
         ? `Disable ${providerName} ticket compliance`
         : inferredId
@@ -1811,11 +1485,6 @@ export default function reviewExtension(pi: ExtensionAPI) {
           value: CONFIGURE_TICKET_COMPLIANCE_VALUE,
           label: ticketToggleLabel,
           description: ticketToggleDescription,
-        },
-        {
-          value: TOGGLE_LOOP_FIXING_VALUE,
-          label: loopToggleLabel,
-          description: loopToggleDescription,
         },
         {
           value: TOGGLE_SEND_TO_CLAUDE_VALUE,
@@ -1881,16 +1550,6 @@ export default function reviewExtension(pi: ExtensionAPI) {
       );
 
       if (!result) return null;
-
-      if (result === TOGGLE_LOOP_FIXING_VALUE) {
-        const nextEnabled = !reviewLoopFixingEnabled;
-        setReviewLoopFixingEnabled(nextEnabled);
-        ctx.ui.notify(
-          nextEnabled ? "Loop fixing enabled" : "Loop fixing disabled",
-          "info",
-        );
-        continue;
-      }
 
       if (result === CONFIGURE_TICKET_COMPLIANCE_VALUE) {
         await toggleTicketCompliance(ctx);
@@ -2526,182 +2185,6 @@ export default function reviewExtension(pi: ExtensionAPI) {
     return result.target;
   }
 
-  function isLoopCompatibleTarget(target: ReviewTarget): boolean {
-    // Only in-place base-branch review supports the fix → re-review loop;
-    // worktree reviews (including PRs) are review-only.
-    return target.type === "baseBranch";
-  }
-
-  async function runLoopFixingReview(
-    ctx: ExtensionCommandContext,
-    target: ReviewTarget,
-  ): Promise<void> {
-    if (reviewLoopInProgress) {
-      ctx.ui.notify("Loop fixing review is already running.", "warning");
-      return;
-    }
-
-    reviewLoopInProgress = true;
-    setReviewWidget(ctx, Boolean(reviewOriginId));
-    try {
-      ctx.ui.notify(
-        "Loop fixing enabled: using Empty branch mode and cycling until no blocking findings remain.",
-        "info",
-      );
-
-      for (let pass = 1; pass <= REVIEW_LOOP_MAX_ITERATIONS; pass++) {
-        const reviewBaselineAssistantId = getLastAssistantSnapshot(ctx)?.id;
-        const started = await executeReview(ctx, target, true, {
-          includeLocalChanges: true,
-        });
-        if (!started) {
-          ctx.ui.notify(
-            "Loop fixing stopped before starting the review pass.",
-            "warning",
-          );
-          return;
-        }
-
-        const reviewTurnStarted = await waitForLoopTurnToStart(
-          ctx,
-          reviewBaselineAssistantId,
-        );
-        if (!reviewTurnStarted) {
-          ctx.ui.notify(
-            "Loop fixing stopped: review pass did not start in time.",
-            "error",
-          );
-          return;
-        }
-
-        await ctx.waitForIdle();
-
-        const reviewSnapshot = getLastAssistantSnapshot(ctx);
-        if (
-          !reviewSnapshot ||
-          reviewSnapshot.id === reviewBaselineAssistantId
-        ) {
-          ctx.ui.notify(
-            "Loop fixing stopped: could not read the review result.",
-            "warning",
-          );
-          return;
-        }
-
-        if (reviewSnapshot.stopReason === "aborted") {
-          ctx.ui.notify("Loop fixing stopped: review was aborted.", "warning");
-          return;
-        }
-
-        if (reviewSnapshot.stopReason === "error") {
-          ctx.ui.notify(
-            "Loop fixing stopped: review failed with an error.",
-            "error",
-          );
-          return;
-        }
-
-        if (reviewSnapshot.stopReason === "length") {
-          ctx.ui.notify(
-            "Loop fixing stopped: review output was truncated (stopReason=length).",
-            "warning",
-          );
-          return;
-        }
-
-        if (!hasBlockingReviewFindings(reviewSnapshot.text)) {
-          const finalized = await executeEndReviewAction(
-            ctx,
-            "returnAndSummarize",
-            {
-              showSummaryLoader: true,
-              notifySuccess: false,
-            },
-          );
-          if (finalized !== "ok") {
-            return;
-          }
-
-          ctx.ui.notify(
-            "Loop fixing complete: no blocking findings remain.",
-            "info",
-          );
-          return;
-        }
-
-        ctx.ui.notify(
-          `Loop fixing pass ${pass}: found blocking findings, returning to fix them...`,
-          "info",
-        );
-
-        const fixBaselineAssistantId = getLastAssistantSnapshot(ctx)?.id;
-        const sentFixPrompt = await executeEndReviewAction(
-          ctx,
-          "returnAndFix",
-          {
-            showSummaryLoader: true,
-            notifySuccess: false,
-          },
-        );
-        if (sentFixPrompt !== "ok") {
-          return;
-        }
-
-        const fixTurnStarted = await waitForLoopTurnToStart(
-          ctx,
-          fixBaselineAssistantId,
-        );
-        if (!fixTurnStarted) {
-          ctx.ui.notify(
-            "Loop fixing stopped: fix pass did not start in time.",
-            "error",
-          );
-          return;
-        }
-
-        await ctx.waitForIdle();
-
-        const fixSnapshot = getLastAssistantSnapshot(ctx);
-        if (!fixSnapshot || fixSnapshot.id === fixBaselineAssistantId) {
-          ctx.ui.notify(
-            "Loop fixing stopped: could not read the fix pass result.",
-            "warning",
-          );
-          return;
-        }
-        if (fixSnapshot.stopReason === "aborted") {
-          ctx.ui.notify(
-            "Loop fixing stopped: fix pass was aborted.",
-            "warning",
-          );
-          return;
-        }
-        if (fixSnapshot.stopReason === "error") {
-          ctx.ui.notify(
-            "Loop fixing stopped: fix pass failed with an error.",
-            "error",
-          );
-          return;
-        }
-        if (fixSnapshot.stopReason === "length") {
-          ctx.ui.notify(
-            "Loop fixing stopped: fix pass output was truncated (stopReason=length).",
-            "warning",
-          );
-          return;
-        }
-      }
-
-      ctx.ui.notify(
-        `Loop fixing stopped after ${REVIEW_LOOP_MAX_ITERATIONS} passes (safety limit reached).`,
-        "warning",
-      );
-    } finally {
-      reviewLoopInProgress = false;
-      setReviewWidget(ctx, Boolean(reviewOriginId));
-    }
-  }
-
   // Register the /review command
   pi.registerCommand("review", {
     description:
@@ -2709,11 +2192,6 @@ export default function reviewExtension(pi: ExtensionAPI) {
     handler: async (args, ctx) => {
       if (!ctx.hasUI) {
         ctx.ui.notify("Review requires interactive mode", "error");
-        return;
-      }
-
-      if (reviewLoopInProgress) {
-        ctx.ui.notify("Loop fixing review is already running.", "warning");
         return;
       }
 
@@ -2772,23 +2250,6 @@ export default function reviewExtension(pi: ExtensionAPI) {
 
         if (!target) {
           ctx.ui.notify("Review cancelled", "info");
-          return;
-        }
-
-        if (reviewLoopFixingEnabled && !isLoopCompatibleTarget(target)) {
-          ctx.ui.notify(
-            "Loop mode only works with base-branch review.",
-            "error",
-          );
-          if (fromSelector) {
-            target = null;
-            continue;
-          }
-          return;
-        }
-
-        if (reviewLoopFixingEnabled) {
-          await runLoopFixingReview(ctx, target);
           return;
         }
 
@@ -3054,14 +2515,6 @@ Instructions:
   async function runEndReview(ctx: ExtensionCommandContext): Promise<void> {
     if (!ctx.hasUI) {
       ctx.ui.notify("End-review requires interactive mode", "error");
-      return;
-    }
-
-    if (reviewLoopInProgress) {
-      ctx.ui.notify(
-        "Loop fixing review is running. Wait for it to finish.",
-        "info",
-      );
       return;
     }
 
