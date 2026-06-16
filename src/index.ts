@@ -70,8 +70,7 @@ let endReviewInProgress = false;
 let reviewTicketComplianceEnabled = false;
 let reviewTicketProvider: "linear" | "jira" = "linear";
 let reviewInferredTicketId: string | undefined = undefined;
-let reviewSendToClaudeEnabled = false;
-let reviewSendToPiEnabled = false;
+let reviewDestination: ReviewDestination = "none";
 
 const REVIEW_STATE_TYPE = "review-session";
 const REVIEW_ANCHOR_TYPE = "review-anchor";
@@ -87,14 +86,31 @@ type ReviewSessionState = {
   originId?: string;
 };
 
+// Where a finished review's findings go. Asked per-review (see the destination
+// prompt), persisted as both the active choice and the next default.
+type ReviewDestination = "claude" | "pi" | "github" | "none";
+
 type ReviewSettingsState = {
   ticketComplianceEnabled?: boolean;
   ticketProvider?: "linear" | "jira";
+  reviewDestination?: ReviewDestination;
+  /** @deprecated migrated to reviewDestination */
   sendToClaudeEnabled?: boolean;
+  /** @deprecated migrated to reviewDestination */
   sendToPiEnabled?: boolean;
   /** @deprecated Read-only compat for old persisted state */
   linearTicketComplianceEnabled?: boolean;
 };
+
+// Map legacy persisted send toggles onto the new single destination.
+function legacyDestination(
+  s: ReviewSettingsState | undefined,
+): ReviewDestination | undefined {
+  if (!s) return undefined;
+  if (s.sendToClaudeEnabled) return "claude";
+  if (s.sendToPiEnabled) return "pi";
+  return undefined;
+}
 
 // Global persistence — survives all session boundaries (fork, navigateTree,
 // resume, restart). Per-session entry persistence is unreliable because /review
@@ -268,7 +284,7 @@ async function getReviewSettings(
 
   debugLog(
     `getReviewSettings: sessionEntry=${session ? "present" : "absent"} ` +
-      `globalSendClaude=${global.sendToClaudeEnabled} sessionSendClaude=${session?.sendToClaudeEnabled}`,
+      `globalDest=${global.reviewDestination} sessionDest=${session?.reviewDestination}`,
   );
 
   // Session entry overrides global file (session > global > defaults).
@@ -279,8 +295,12 @@ async function getReviewSettings(
       global.ticketComplianceEnabled ??
       global.linearTicketComplianceEnabled,
     ticketProvider: session?.ticketProvider ?? global.ticketProvider ?? "linear",
-    sendToClaudeEnabled: session?.sendToClaudeEnabled ?? global.sendToClaudeEnabled,
-    sendToPiEnabled: session?.sendToPiEnabled ?? global.sendToPiEnabled,
+    reviewDestination:
+      session?.reviewDestination ??
+      global.reviewDestination ??
+      legacyDestination(session) ??
+      legacyDestination(global) ??
+      "none",
   };
 }
 
@@ -288,11 +308,10 @@ async function applyReviewSettings(ctx: ExtensionContext) {
   const state = await getReviewSettings(ctx);
   reviewTicketComplianceEnabled = state.ticketComplianceEnabled === true;
   reviewTicketProvider = state.ticketProvider ?? "linear";
-  reviewSendToClaudeEnabled = state.sendToClaudeEnabled === true;
-  reviewSendToPiEnabled = state.sendToPiEnabled === true;
+  reviewDestination = state.reviewDestination ?? "none";
   debugLog(
-    `applyReviewSettings result: sendClaude=${reviewSendToClaudeEnabled} ` +
-      `sendPi=${reviewSendToPiEnabled} originId=${reviewOriginId ?? "none"}`,
+    `applyReviewSettings result: destination=${reviewDestination} ` +
+      `originId=${reviewOriginId ?? "none"}`,
   );
 }
 
@@ -1071,21 +1090,16 @@ const REVIEW_PRESETS = [
 ] as const;
 
 const CONFIGURE_TICKET_COMPLIANCE_VALUE = "configureTicketCompliance" as const;
-const TOGGLE_SEND_TO_CLAUDE_VALUE = "toggleSendToClaude" as const;
-const TOGGLE_SEND_TO_PI_VALUE = "toggleSendToPi" as const;
 type ReviewPresetValue =
   | (typeof REVIEW_PRESETS)[number]["value"]
-  | typeof CONFIGURE_TICKET_COMPLIANCE_VALUE
-  | typeof TOGGLE_SEND_TO_CLAUDE_VALUE
-  | typeof TOGGLE_SEND_TO_PI_VALUE;
+  | typeof CONFIGURE_TICKET_COMPLIANCE_VALUE;
 
 export default function reviewExtension(pi: ExtensionAPI) {
   function persistReviewSettings() {
     const snapshot: ReviewSettingsState = {
       ticketComplianceEnabled: reviewTicketComplianceEnabled,
       ticketProvider: reviewTicketProvider,
-      sendToClaudeEnabled: reviewSendToClaudeEnabled,
-      sendToPiEnabled: reviewSendToPiEnabled,
+      reviewDestination,
     };
     pi.appendEntry(REVIEW_SETTINGS_TYPE, snapshot);
     // Fire-and-forget global save. Survives any session boundary that the
@@ -1107,17 +1121,9 @@ export default function reviewExtension(pi: ExtensionAPI) {
     persistReviewSettings();
   }
 
-  function setSendToClaudeEnabled(enabled: boolean) {
-    reviewSendToClaudeEnabled = enabled;
-    if (enabled) reviewSendToPiEnabled = false;
-    debugLog(`setSendToClaudeEnabled(${enabled})`);
-    persistReviewSettings();
-  }
-
-  function setSendToPiEnabled(enabled: boolean) {
-    reviewSendToPiEnabled = enabled;
-    if (enabled) reviewSendToClaudeEnabled = false;
-    debugLog(`setSendToPiEnabled(${enabled})`);
+  function setReviewDestination(destination: ReviewDestination) {
+    reviewDestination = destination;
+    debugLog(`setReviewDestination(${destination})`);
     persistReviewSettings();
   }
 
@@ -1387,6 +1393,23 @@ export default function reviewExtension(pi: ExtensionAPI) {
     });
   }
 
+  function postFindingsToGitHub(): void {
+    // The model already has the findings in context from the review turn; ask
+    // it to publish them to the PR. It resolves the PR itself (works for
+    // branch, worktree, and PR targets). Publish-only — no loop, no edits.
+    const prompt = `Publish the code review findings above to the matching GitHub pull request using \`gh api\`.
+
+1. Find the PR for the branch you just reviewed (e.g. \`gh pr view <branch> --json number,headRefName\`; for a worktree review it is the branch checked out in that worktree). If there is no open PR, stop and say so — do not create one.
+2. Add an inline review comment for each actionable finding, anchored to the file and line in the PR diff.
+3. Submit the review in the same call:
+   - verdict "needs attention" (blocking findings) -> event REQUEST_CHANGES
+   - verdict "correct" (no blocking findings) -> event APPROVE
+4. Report the PR number, the event submitted, and how many comments you posted.
+
+Do not modify any code. This is a publish-only step.`;
+    pi.sendUserMessage(prompt, { deliverAs: "followUp" });
+  }
+
   pi.on("turn_end", async (event, ctx) => {
     const assistantMsg = event.message;
     const isAssistant = assistantMsg.role === "assistant";
@@ -1398,7 +1421,7 @@ export default function reviewExtension(pi: ExtensionAPI) {
     const hasVerdict = !!text && hasReviewVerdict(text);
 
     debugLog(
-      `turn_end: sendClaude=${reviewSendToClaudeEnabled} sendPi=${reviewSendToPiEnabled} ` +
+      `turn_end: destination=${reviewDestination} ` +
         `originId=${reviewOriginId ?? "none"} role=${assistantMsg.role} ` +
         `textLen=${text?.length ?? 0} hasVerdict=${hasVerdict}` +
         // When text is present but verdict missed, log the tail so we can see
@@ -1408,16 +1431,17 @@ export default function reviewExtension(pi: ExtensionAPI) {
           : ""),
     );
 
-    if ((!reviewSendToClaudeEnabled && !reviewSendToPiEnabled) || !reviewOriginId)
-      return;
+    if (reviewDestination === "none" || !reviewOriginId) return;
     if (!isAssistant) return;
     if (!text) return;
     if (!hasVerdict) return;
 
-    if (reviewSendToClaudeEnabled) {
+    if (reviewDestination === "claude") {
       await sendFindingsToClaude(text, ctx);
-    } else if (reviewSendToPiEnabled) {
+    } else if (reviewDestination === "pi") {
       await sendFindingsToPi(text, ctx);
+    } else if (reviewDestination === "github") {
+      postFindingsToGitHub();
     }
   });
 
@@ -1467,34 +1491,12 @@ export default function reviewExtension(pi: ExtensionAPI) {
         : inferredId
           ? `(auto ${inferredId})`
           : "(infer from branch/HEAD)";
-      const sendToClaudeLabel = reviewSendToClaudeEnabled
-        ? "Disable send to Claude (tmux)"
-        : "Enable send to Claude (tmux)";
-      const sendToClaudeDescription = reviewSendToClaudeEnabled
-        ? "(currently on)"
-        : "(currently off)";
-      const sendToPiLabel = reviewSendToPiEnabled
-        ? "Disable send to Pi (session-control)"
-        : "Enable send to Pi (session-control)";
-      const sendToPiDescription = reviewSendToPiEnabled
-        ? "(currently on)"
-        : "(currently off)";
       const items: SelectItem[] = [
         ...presetItems,
         {
           value: CONFIGURE_TICKET_COMPLIANCE_VALUE,
           label: ticketToggleLabel,
           description: ticketToggleDescription,
-        },
-        {
-          value: TOGGLE_SEND_TO_CLAUDE_VALUE,
-          label: sendToClaudeLabel,
-          description: sendToClaudeDescription,
-        },
-        {
-          value: TOGGLE_SEND_TO_PI_VALUE,
-          label: sendToPiLabel,
-          description: sendToPiDescription,
         },
       ];
 
@@ -1553,30 +1555,6 @@ export default function reviewExtension(pi: ExtensionAPI) {
 
       if (result === CONFIGURE_TICKET_COMPLIANCE_VALUE) {
         await toggleTicketCompliance(ctx);
-        continue;
-      }
-
-      if (result === TOGGLE_SEND_TO_CLAUDE_VALUE) {
-        const nextEnabled = !reviewSendToClaudeEnabled;
-        setSendToClaudeEnabled(nextEnabled);
-        ctx.ui.notify(
-          nextEnabled
-            ? "Send to Claude enabled (findings will be pasted to Claude's tmux pane)"
-            : "Send to Claude disabled",
-          "info",
-        );
-        continue;
-      }
-
-      if (result === TOGGLE_SEND_TO_PI_VALUE) {
-        const nextEnabled = !reviewSendToPiEnabled;
-        setSendToPiEnabled(nextEnabled);
-        ctx.ui.notify(
-          nextEnabled
-            ? "Send to Pi enabled (findings will be sent via session-control socket)"
-            : "Send to Pi disabled",
-          "info",
-        );
         continue;
       }
 
@@ -1749,11 +1727,49 @@ export default function reviewExtension(pi: ExtensionAPI) {
    * Generic fuzzy single-select over a list of items. Returns the chosen
    * item.value, or null on cancel. Shared UI for the branch/ref pickers.
    */
+  // Ask, every review, where the findings should go. Single-select, last
+  // choice pre-selected. Returns null on cancel.
+  async function askReviewDestination(
+    ctx: ExtensionContext,
+  ): Promise<ReviewDestination | null> {
+    const items: SelectItem[] = [
+      {
+        value: "claude",
+        label: "Send to Claude (tmux)",
+        description: "hand findings to Claude to fix — loops",
+      },
+      {
+        value: "pi",
+        label: "Send to Pi (session-control)",
+        description: "hand findings to another Pi to fix — loops",
+      },
+      {
+        value: "github",
+        label: "Post to GitHub",
+        description: "request changes / approve on the PR, then stop",
+      },
+      {
+        value: "none",
+        label: "Keep here",
+        description: "don't send anywhere",
+      },
+    ];
+    const choice = await fuzzySelect(
+      ctx,
+      "What to do with this review's findings?",
+      items,
+      "No options",
+      reviewDestination,
+    );
+    return choice as ReviewDestination | null;
+  }
+
   async function fuzzySelect(
     ctx: ExtensionContext,
     title: string,
     items: SelectItem[],
     noMatchLabel: string,
+    defaultValue?: string,
   ): Promise<string | null> {
     if (items.length === 0) return null;
     return ctx.ui.custom<string | null>((tui, theme, keybindings, done) => {
@@ -1801,6 +1817,10 @@ export default function reviewExtension(pi: ExtensionAPI) {
 
         selectList.onSelect = (item) => done(item.value);
         selectList.onCancel = () => done(null);
+        if (defaultValue) {
+          const idx = filteredItems.findIndex((i) => i.value === defaultValue);
+          if (idx >= 0) selectList.setSelectedIndex(idx);
+        }
         listContainer.addChild(selectList);
       };
 
@@ -2279,6 +2299,17 @@ export default function reviewExtension(pi: ExtensionAPI) {
 
           useFreshSession = choice === "Empty branch";
         }
+
+        const destination = await askReviewDestination(ctx);
+        if (destination === null) {
+          if (fromSelector) {
+            target = null;
+            continue;
+          }
+          ctx.ui.notify("Review cancelled", "info");
+          return;
+        }
+        setReviewDestination(destination);
 
         await executeReview(ctx, target, useFreshSession);
         return;

@@ -9,7 +9,7 @@ Based on the original [review extension](https://github.com/mitsuhiko/agent-stuf
 - Interactive code review against a base branch — the current branch in place, any local/remote branch in an isolated worktree, or a GitHub PR
 - Worktree & PR reviews are materialized on demand (fetched if remote) into a throwaway git worktree that never touches your working tree, and are removed at `/end-review`
 - Ticket compliance checking for **Linear** and **Jira** (inferred from branch name or HEAD commit)
-- Send review findings to Claude's tmux pane for cross-agent workflows
+- Per-review choice of where findings go — Claude (tmux), another Pi (session-control), or posted to the GitHub PR — asked every review so you never forget
 - Project-specific review guidelines via `REVIEW_GUIDELINES.md`
 - Fresh session branching for isolated reviews with `/end-review` to return
 
@@ -31,7 +31,15 @@ Requires `@earendil-works/pi-ai` and `@earendil-works/pi-coding-agent` >= 0.49.0
 ### Toggles in the selector
 
 - **Ticket compliance** — enable Linear (`linear issue view AAA-123`) or Jira (`jira issue view AAA-123 --plain`) compliance checking. Ticket ID is auto-inferred from branch name or HEAD commit.
-- **Send to Claude (tmux)** — paste review findings into Claude's tmux pane when the review finishes. Uses the [pi-mux](https://github.com/mitsuhiko/agent-stuff) pane detection pattern.
+
+### Where findings go
+
+After you pick what to review, every review asks **"What to do with this review's findings?"** (your last choice is pre-selected):
+
+- **Send to Claude (tmux)** — paste findings into Claude's tmux pane to fix; loops until clean. Uses the [pi-mux](https://github.com/mitsuhiko/agent-stuff) pane detection pattern.
+- **Send to Pi (session-control)** — hand findings to another Pi session over its control socket to fix; loops.
+- **Post to GitHub** — publish findings to the PR via `gh api` (REQUEST_CHANGES if needs-attention, APPROVE if correct), then stop.
+- **Keep here** — don't send anywhere.
 
 ### Finishing a review
 
