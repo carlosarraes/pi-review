@@ -2,22 +2,19 @@
  * Code Review Extension (inspired by Codex's review feature)
  *
  * Provides a `/review` command that prompts the agent to review code changes.
- * Supports multiple review modes:
- * - Review a GitHub pull request (checks out the PR locally)
- * - Review against a base branch (PR style)
- * - Review uncommitted changes
- * - Review a specific commit
- * - Custom review instructions
+ * Supports three review modes, all diffing against a base branch:
+ * - Review against a base branch (current branch, in place)
+ * - Review a worktree against a branch (any local or remote branch, in an
+ *   isolated worktree materialized on demand and removed at /end-review)
+ * - Review a GitHub pull request (fetched into an isolated worktree)
  *
  * Usage:
  * - `/review` - show interactive selector
- * - `/review pr 123` - review PR #123 (checks out locally)
+ * - `/review branch main` - review the current branch against main
+ * - `/review worktree feature-x main` - review branch feature-x against main in
+ *   an isolated worktree (fetches feature-x first when it is remote-only)
+ * - `/review pr 123` - review PR #123 in an isolated worktree
  * - `/review pr https://github.com/owner/repo/pull/123` - review PR from URL
- * - `/review uncommitted` - review uncommitted changes directly
- * - `/review branch main` - review against main branch
- * - `/review commit abc123` - review specific commit
- * - `/review folder src docs` - review specific folders/files (snapshot, not diff)
- * - `/review custom "check for security issues"` - custom instructions
  *
  * Project-specific review guidelines:
  * - If a REVIEW_GUIDELINES.md file exists in the same directory as .pi,
@@ -40,7 +37,8 @@
  * - If a CLAUDE.md or AGENTS.md file exists, the reviewer is instructed to read it
  *   and verify the changes follow those project rules as well.
  *
- * Note: PR review requires a clean working tree (no uncommitted changes to tracked files).
+ * Note: worktree and PR reviews run in an isolated git worktree, so they never
+ * touch your working tree (you can review with uncommitted local changes).
  */
 
 import type {
@@ -59,6 +57,7 @@ import {
   Text,
 } from "@earendil-works/pi-tui";
 import { promises as fs, appendFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import * as net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -109,6 +108,11 @@ type ReviewSettingsState = {
 // pi-mono refactor). Session entry remains as override (session > global).
 const PI_REVIEW_STATE_DIR = path.join(os.homedir(), ".pi-review");
 const PI_REVIEW_STATE_FILE = path.join(PI_REVIEW_STATE_DIR, "state.json");
+const PI_REVIEW_WORKTREES_FILE = path.join(
+  PI_REVIEW_STATE_DIR,
+  "worktrees.json",
+);
+const PI_REVIEW_WORKTREES_DIR = path.join(PI_REVIEW_STATE_DIR, "worktrees");
 const PI_REVIEW_DEBUG_LOG = path.join(PI_REVIEW_STATE_DIR, "debug.log");
 
 // Pi's TUI suppresses raw stderr; write to a file so logs survive regardless of UI state.
@@ -142,6 +146,63 @@ async function saveGlobalSettings(state: ReviewSettingsState): Promise<void> {
   const tmp = PI_REVIEW_STATE_FILE + ".tmp";
   await fs.writeFile(tmp, JSON.stringify(state, null, 2), "utf8");
   await fs.rename(tmp, PI_REVIEW_STATE_FILE);
+}
+
+// --- Worktree registry ----------------------------------------------------
+// Worktree reviews create on-disk git worktrees that must outlive the current
+// process: a restart/resume mid-review must still be able to remove them at
+// /end-review. We persist them per-repo (keyed by repo root) in their own file
+// so settings writes and worktree writes never race.
+type WorktreeRecord = {
+  path: string;
+  ref: string;
+  sha: string;
+  /** PR head fetch ref (refs/pi-review/pr-<n>) to delete on cleanup, if any. */
+  tempRef?: string;
+  createdAt: string;
+};
+
+type WorktreeRegistry = Record<string, WorktreeRecord[]>;
+
+async function loadWorktreeRegistry(): Promise<WorktreeRegistry> {
+  try {
+    const raw = await fs.readFile(PI_REVIEW_WORKTREES_FILE, "utf8");
+    return JSON.parse(raw) as WorktreeRegistry;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+      debugLog(`loadWorktreeRegistry failed: ${err}`);
+    }
+    return {};
+  }
+}
+
+async function saveWorktreeRegistry(reg: WorktreeRegistry): Promise<void> {
+  await fs.mkdir(PI_REVIEW_STATE_DIR, { recursive: true });
+  const tmp = PI_REVIEW_WORKTREES_FILE + ".tmp";
+  await fs.writeFile(tmp, JSON.stringify(reg, null, 2), "utf8");
+  await fs.rename(tmp, PI_REVIEW_WORKTREES_FILE);
+}
+
+async function recordWorktree(
+  repoRoot: string,
+  record: WorktreeRecord,
+): Promise<void> {
+  const reg = await loadWorktreeRegistry();
+  reg[repoRoot] = [...(reg[repoRoot] ?? []), record];
+  await saveWorktreeRegistry(reg);
+}
+
+async function getWorktreeRecords(repoRoot: string): Promise<WorktreeRecord[]> {
+  const reg = await loadWorktreeRegistry();
+  return reg[repoRoot] ?? [];
+}
+
+async function clearWorktreeRecords(repoRoot: string): Promise<void> {
+  const reg = await loadWorktreeRegistry();
+  if (reg[repoRoot]) {
+    delete reg[repoRoot];
+    await saveWorktreeRegistry(reg);
+  }
 }
 
 function setReviewWidget(ctx: ExtensionContext, active: boolean) {
@@ -505,17 +566,26 @@ function hasBlockingReviewFindings(messageText: string): boolean {
 
 // Review target types (matching Codex's approach)
 type ReviewTarget =
-  | { type: "uncommitted" }
   | { type: "baseBranch"; branch: string }
-  | { type: "commit"; sha: string; title?: string }
-  | { type: "custom"; instructions: string }
-  | { type: "pullRequest"; prNumber: number; baseBranch: string; title: string }
-  | { type: "folder"; paths: string[] };
+  | {
+      // An isolated worktree materialized on demand for the review. Covers both
+      // "review a (local or remote) branch" and "review a PR" — a PR is just
+      // remote work reviewed against a base. Removed at /end-review.
+      type: "worktree";
+      worktreePath: string;
+      reviewSha: string;
+      baseBranch: string;
+      mergeBaseSha: string | null;
+      label: string;
+      pr?: { number: number };
+      // Set only for PRs: the fetched ref (refs/pi-review/pr-<n>) to delete on cleanup.
+      tempRef?: string;
+    };
+
+// The worktree variant alone — what the materialize* helpers produce.
+type WorktreeTarget = Extract<ReviewTarget, { type: "worktree" }>;
 
 // Prompts (adapted from Codex)
-const UNCOMMITTED_PROMPT =
-  "Review the current code changes (staged, unstaged, and untracked files) and provide prioritized findings.";
-
 const LOCAL_CHANGES_REVIEW_INSTRUCTIONS =
   "Also include local working-tree changes (staged, unstaged, and untracked files) from this branch. Use `git status --porcelain`, `git diff`, `git diff --staged`, and `git ls-files --others --exclude-standard` so local fixes are part of this review cycle.";
 
@@ -525,20 +595,13 @@ const BASE_BRANCH_PROMPT_WITH_MERGE_BASE =
 const BASE_BRANCH_PROMPT_FALLBACK =
   'Review the code changes against the base branch \'{branch}\'. Start by finding the merge diff between the current branch and {branch}\'s upstream e.g. (`git merge-base HEAD "$(git rev-parse --abbrev-ref "{branch}@{upstream}")"`), then run `git diff` against that SHA to see what changes we would merge into the {branch} branch. Provide prioritized, actionable findings.';
 
-const COMMIT_PROMPT_WITH_TITLE =
-  'Review the code changes introduced by commit {sha} ("{title}"). Provide prioritized, actionable findings.';
+// Worktree reviews (and PRs) run against code checked out in a SEPARATE worktree.
+// The prompt must steer the model to that path, never the current working dir.
+const WORKTREE_REVIEW_PROMPT_WITH_MERGE_BASE =
+  "Review the code changes for {label} against the base branch '{baseBranch}'. The code is checked out in a separate git worktree at {worktreePath} — review THAT worktree, not the current working directory. The merge base commit for this comparison is {mergeBaseSha}. Run `git -C {worktreePath} diff {mergeBaseSha}` to inspect the changes, and read files under {worktreePath} for full context. Provide prioritized, actionable findings.";
 
-const COMMIT_PROMPT =
-  "Review the code changes introduced by commit {sha}. Provide prioritized, actionable findings.";
-
-const PULL_REQUEST_PROMPT =
-  "Review pull request #{prNumber} (\"{title}\") against the base branch '{baseBranch}'. The merge base commit for this comparison is {mergeBaseSha}. Run `git diff {mergeBaseSha}` to inspect the changes that would be merged. Provide prioritized, actionable findings.";
-
-const PULL_REQUEST_PROMPT_FALLBACK =
-  "Review pull request #{prNumber} (\"{title}\") against the base branch '{baseBranch}'. Start by finding the merge base between the current branch and {baseBranch} (e.g., `git merge-base HEAD {baseBranch}`), then run `git diff` against that SHA to see the changes that would be merged. Provide prioritized, actionable findings.";
-
-const FOLDER_REVIEW_PROMPT =
-  "Review the code in the following paths: {paths}. This is a snapshot review (not a diff). Read the files directly in these paths and provide prioritized, actionable findings.";
+const WORKTREE_REVIEW_PROMPT_FALLBACK =
+  "Review the code changes for {label} against the base branch '{baseBranch}'. The code is checked out in a separate git worktree at {worktreePath} — review THAT worktree, not the current working directory. Find the merge base with `git -C {worktreePath} merge-base {baseBranch} HEAD`, then run `git -C {worktreePath} diff <merge-base>` to inspect the changes. Provide prioritized, actionable findings.";
 
 const LINEAR_TICKET_REVIEW_PROMPT =
   "Also review compliance with Linear ticket {ticketId}. Before finalizing the review, run `linear issue view {ticketId}` to inspect the ticket details, acceptance criteria, and any discussion/comments returned by the ticket view. Treat clarifications, follow-up questions, and additional implementation details from comments as part of the ticket context when they are relevant. Keep doing the normal code review, and additionally flag concrete mismatches, missing behavior, or contradictory behavior relative to the ticket body or comments when they are actionable. If the Linear command fails, explicitly say ticket compliance could not be verified and continue the normal review.";
@@ -729,57 +792,6 @@ async function getLocalBranches(pi: ExtensionAPI): Promise<string[]> {
 }
 
 /**
- * Get list of recent commits
- */
-async function getRecentCommits(
-  pi: ExtensionAPI,
-  limit: number = 10,
-): Promise<Array<{ sha: string; title: string }>> {
-  const { stdout, code } = await pi.exec("git", [
-    "log",
-    `--oneline`,
-    `-n`,
-    `${limit}`,
-  ]);
-  if (code !== 0) return [];
-
-  return stdout
-    .trim()
-    .split("\n")
-    .filter((line) => line.trim())
-    .map((line) => {
-      const [sha, ...rest] = line.trim().split(" ");
-      return { sha, title: rest.join(" ") };
-    });
-}
-
-/**
- * Check if there are uncommitted changes (staged, unstaged, or untracked)
- */
-async function hasUncommittedChanges(pi: ExtensionAPI): Promise<boolean> {
-  const { stdout, code } = await pi.exec("git", ["status", "--porcelain"]);
-  return code === 0 && stdout.trim().length > 0;
-}
-
-/**
- * Check if there are changes that would prevent switching branches
- * (staged or unstaged changes to tracked files - untracked files are fine)
- */
-async function hasPendingChanges(pi: ExtensionAPI): Promise<boolean> {
-  // Check for staged or unstaged changes to tracked files
-  const { stdout, code } = await pi.exec("git", ["status", "--porcelain"]);
-  if (code !== 0) return false;
-
-  // Filter out untracked files (lines starting with ??)
-  const lines = stdout
-    .trim()
-    .split("\n")
-    .filter((line) => line.trim());
-  const trackedChanges = lines.filter((line) => !line.startsWith("??"));
-  return trackedChanges.length > 0;
-}
-
-/**
  * Parse a PR reference (URL or number) and return the PR number
  */
 function parsePrReference(ref: string): number | null {
@@ -891,29 +903,6 @@ async function getPrInfo(
 }
 
 /**
- * Checkout a PR using GitHub CLI
- */
-async function checkoutPr(
-  pi: ExtensionAPI,
-  prNumber: number,
-): Promise<{ success: boolean; error?: string }> {
-  const { stdout, stderr, code } = await pi.exec("gh", [
-    "pr",
-    "checkout",
-    String(prNumber),
-  ]);
-
-  if (code !== 0) {
-    return {
-      success: false,
-      error: stderr || stdout || "Failed to checkout PR",
-    };
-  }
-
-  return { success: true };
-}
-
-/**
  * Get the current branch name
  */
 async function getCurrentBranch(pi: ExtensionAPI): Promise<string | null> {
@@ -947,6 +936,274 @@ async function getDefaultBranch(pi: ExtensionAPI): Promise<string> {
 }
 
 /**
+ * Absolute repo root (toplevel of the current working tree).
+ */
+async function getRepoRoot(pi: ExtensionAPI): Promise<string | null> {
+  const { stdout, code } = await pi.exec("git", [
+    "rev-parse",
+    "--show-toplevel",
+  ]);
+  if (code === 0 && stdout.trim()) return stdout.trim();
+  return null;
+}
+
+/**
+ * Merge base between two arbitrary refs (generalizes getMergeBase, which is
+ * fixed to HEAD). Used to diff a worktree's tip against its base branch.
+ */
+async function getMergeBaseBetween(
+  pi: ExtensionAPI,
+  a: string,
+  b: string,
+): Promise<string | null> {
+  const { stdout, code } = await pi.exec("git", ["merge-base", a, b]);
+  if (code === 0 && stdout.trim()) return stdout.trim();
+  return null;
+}
+
+/**
+ * All branch refs for the unified picker: local heads + remote-tracking
+ * branches (origin/HEAD and friends excluded — they are pointer aliases).
+ */
+async function getAllBranchRefs(pi: ExtensionAPI): Promise<string[]> {
+  const { stdout, code } = await pi.exec("git", [
+    "for-each-ref",
+    "--format=%(refname:short)",
+    "refs/heads",
+    "refs/remotes",
+  ]);
+  if (code !== 0) return [];
+  return stdout
+    .trim()
+    .split("\n")
+    .map((b) => b.trim())
+    .filter((b) => b && !b.endsWith("/HEAD"));
+}
+
+function shortHash(input: string): string {
+  return createHash("sha1").update(input).digest("hex").slice(0, 8);
+}
+
+/**
+ * Deterministic on-disk location for a review worktree:
+ * ~/.pi-review/worktrees/<repoName>-<hash>/<sanitized-ref>-<shortSha>
+ */
+function worktreePathFor(repoRoot: string, ref: string, sha: string): string {
+  const repoKey = `${path.basename(repoRoot)}-${shortHash(repoRoot)}`;
+  const safeRef = ref.replace(/[^a-zA-Z0-9._-]/g, "-").replace(/^-+|-+$/g, "");
+  return path.join(
+    PI_REVIEW_WORKTREES_DIR,
+    repoKey,
+    `${safeRef || "ref"}-${sha.slice(0, 8)}`,
+  );
+}
+
+type MaterializeResult =
+  | { ok: true; target: WorktreeTarget }
+  | { ok: false; error: string };
+
+/**
+ * Create a DETACHED worktree at `sha` and return a worktree ReviewTarget.
+ * Detached (not on the branch) so it works even when `ref` is already checked
+ * out in another worktree — git forbids the same branch in two worktrees.
+ * Records it so /end-review (or the orphan sweep) can remove it later.
+ */
+async function createWorktreeTarget(
+  pi: ExtensionAPI,
+  opts: {
+    repoRoot: string;
+    ref: string;
+    sha: string;
+    baseBranch: string;
+    label: string;
+    pr?: { number: number };
+    tempRef?: string;
+  },
+): Promise<MaterializeResult> {
+  const worktreePath = worktreePathFor(opts.repoRoot, opts.ref, opts.sha);
+  await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+
+  const { stderr, code } = await pi.exec("git", [
+    "-C",
+    opts.repoRoot,
+    "worktree",
+    "add",
+    "--detach",
+    worktreePath,
+    opts.sha,
+  ]);
+  if (code !== 0) {
+    return { ok: false, error: stderr.trim() || "git worktree add failed" };
+  }
+
+  await recordWorktree(opts.repoRoot, {
+    path: worktreePath,
+    ref: opts.ref,
+    sha: opts.sha,
+    tempRef: opts.tempRef,
+    createdAt: new Date().toISOString(),
+  });
+
+  const mergeBaseSha = await getMergeBaseBetween(pi, opts.sha, opts.baseBranch);
+
+  return {
+    ok: true,
+    target: {
+      type: "worktree",
+      worktreePath,
+      reviewSha: opts.sha,
+      baseBranch: opts.baseBranch,
+      mergeBaseSha,
+      label: opts.label,
+      pr: opts.pr,
+      tempRef: opts.tempRef,
+    },
+  };
+}
+
+/**
+ * Resolve a picked branch ref to a commit SHA, fetching when it is remote.
+ *
+ * DESIGN NOTE (workflow-specific — tune to taste): a ref that names a known
+ * remote (e.g. `origin/feature-x`) is treated as remote and always fetched, so
+ * the worktree reflects the latest pushed state rather than a stale tracking
+ * ref. Local refs are used as-is. Adjust here if you'd rather trust the local
+ * tracking ref, or fetch from a specific remote by name.
+ */
+async function resolveReviewRef(
+  pi: ExtensionAPI,
+  ref: string,
+): Promise<{ ok: true; sha: string } | { ok: false; error: string }> {
+  const slash = ref.indexOf("/");
+  if (slash > 0) {
+    const remote = ref.slice(0, slash);
+    const branch = ref.slice(slash + 1);
+    const { stdout: remotes } = await pi.exec("git", ["remote"]);
+    const knownRemote = remotes
+      .trim()
+      .split("\n")
+      .map((r) => r.trim())
+      .includes(remote);
+    if (knownRemote) {
+      const { code: fetchCode, stderr } = await pi.exec("git", [
+        "fetch",
+        remote,
+        branch,
+      ]);
+      if (fetchCode !== 0) {
+        return { ok: false, error: stderr.trim() || `failed to fetch ${ref}` };
+      }
+    }
+  }
+
+  const { stdout, code } = await pi.exec("git", ["rev-parse", "--verify", ref]);
+  if (code !== 0 || !stdout.trim()) {
+    return { ok: false, error: `could not resolve ref '${ref}'` };
+  }
+  return { ok: true, sha: stdout.trim() };
+}
+
+/**
+ * Materialize a worktree for a (local or remote) branch reviewed against base.
+ */
+async function materializeWorktree(
+  pi: ExtensionAPI,
+  reviewRef: string,
+  baseBranch: string,
+): Promise<MaterializeResult> {
+  const repoRoot = await getRepoRoot(pi);
+  if (!repoRoot) return { ok: false, error: "not a git repository" };
+
+  const resolved = await resolveReviewRef(pi, reviewRef);
+  if (!resolved.ok) return resolved;
+
+  return createWorktreeTarget(pi, {
+    repoRoot,
+    ref: reviewRef,
+    sha: resolved.sha,
+    baseBranch,
+    label: `branch '${reviewRef}'`,
+  });
+}
+
+/**
+ * Materialize a worktree for a GitHub PR reviewed against its base branch.
+ * Fetches pull/<n>/head into a namespaced ref (works for fork PRs too) so we
+ * never mutate the working tree the way `gh pr checkout` does.
+ */
+async function materializePrWorktree(
+  pi: ExtensionAPI,
+  prNumber: number,
+): Promise<MaterializeResult> {
+  const repoRoot = await getRepoRoot(pi);
+  if (!repoRoot) return { ok: false, error: "not a git repository" };
+
+  const info = await getPrInfo(pi, prNumber);
+  if (!info) {
+    return { ok: false, error: `could not read PR #${prNumber} via gh` };
+  }
+
+  const tempRef = `refs/pi-review/pr-${prNumber}`;
+  const { code: fetchCode, stderr } = await pi.exec("git", [
+    "fetch",
+    "origin",
+    `pull/${prNumber}/head:${tempRef}`,
+  ]);
+  if (fetchCode !== 0) {
+    return {
+      ok: false,
+      error: stderr.trim() || `failed to fetch PR #${prNumber}`,
+    };
+  }
+
+  const { stdout: sha, code: revCode } = await pi.exec("git", [
+    "rev-parse",
+    "--verify",
+    tempRef,
+  ]);
+  if (revCode !== 0 || !sha.trim()) {
+    return { ok: false, error: `could not resolve PR #${prNumber} head` };
+  }
+
+  return createWorktreeTarget(pi, {
+    repoRoot,
+    ref: `pr-${prNumber}`,
+    sha: sha.trim(),
+    baseBranch: info.baseBranch,
+    label: `PR #${prNumber} ("${info.title}")`,
+    pr: { number: prNumber },
+    tempRef,
+  });
+}
+
+/**
+ * Remove all review worktrees for a repo: git worktree remove + prune, delete
+ * any PR fetch refs, then clear the registry. Best-effort and idempotent.
+ */
+async function cleanupReviewWorktrees(
+  pi: ExtensionAPI,
+  repoRoot: string,
+): Promise<void> {
+  const records = await getWorktreeRecords(repoRoot);
+  for (const rec of records) {
+    await pi.exec("git", [
+      "-C",
+      repoRoot,
+      "worktree",
+      "remove",
+      "--force",
+      rec.path,
+    ]);
+    await fs.rm(rec.path, { recursive: true, force: true }).catch(() => {});
+    if (rec.tempRef) {
+      await pi.exec("git", ["-C", repoRoot, "update-ref", "-d", rec.tempRef]);
+    }
+  }
+  await pi.exec("git", ["-C", repoRoot, "worktree", "prune"]);
+  await clearWorktreeRecords(repoRoot);
+}
+
+/**
  * Build the review prompt based on target
  */
 async function buildReviewPrompt(
@@ -965,10 +1222,6 @@ async function buildReviewPrompt(
   let basePrompt: string;
 
   switch (target.type) {
-    case "uncommitted":
-      basePrompt = UNCOMMITTED_PROMPT;
-      break;
-
     case "baseBranch": {
       const mergeBase = await getMergeBase(pi, target.branch);
       const branchPrompt = mergeBase
@@ -983,44 +1236,20 @@ async function buildReviewPrompt(
       break;
     }
 
-    case "commit":
-      basePrompt = target.title
-        ? COMMIT_PROMPT_WITH_TITLE.replace("{sha}", target.sha).replace(
-            "{title}",
-            target.title,
-          )
-        : COMMIT_PROMPT.replace("{sha}", target.sha);
-      break;
-
-    case "custom":
-      basePrompt = target.instructions;
-      break;
-
-    case "pullRequest": {
-      const mergeBase = await getMergeBase(pi, target.baseBranch);
-      const prPrompt = mergeBase
-        ? PULL_REQUEST_PROMPT.replace(/{prNumber}/g, String(target.prNumber))
-            .replace(/{title}/g, target.title)
-            .replace(/{baseBranch}/g, target.baseBranch)
-            .replace(/{mergeBaseSha}/g, mergeBase)
-        : PULL_REQUEST_PROMPT_FALLBACK.replace(
-            /{prNumber}/g,
-            String(target.prNumber),
-          )
-            .replace(/{title}/g, target.title)
-            .replace(/{baseBranch}/g, target.baseBranch);
-      basePrompt = includeLocalChanges
-        ? `${prPrompt} ${LOCAL_CHANGES_REVIEW_INSTRUCTIONS}`
-        : prPrompt;
+    case "worktree": {
+      // Review-only by design (no includeLocalChanges): the worktree is a
+      // read-only materialization of someone else's / remote work.
+      const fill = (template: string) =>
+        template
+          .replace(/{label}/g, target.label)
+          .replace(/{baseBranch}/g, target.baseBranch)
+          .replace(/{worktreePath}/g, target.worktreePath)
+          .replace(/{mergeBaseSha}/g, target.mergeBaseSha ?? "");
+      basePrompt = target.mergeBaseSha
+        ? fill(WORKTREE_REVIEW_PROMPT_WITH_MERGE_BASE)
+        : fill(WORKTREE_REVIEW_PROMPT_FALLBACK);
       break;
     }
-
-    case "folder":
-      basePrompt = FOLDER_REVIEW_PROMPT.replace(
-        "{paths}",
-        target.paths.join(", "),
-      );
-      break;
   }
 
   if (!ticketId) {
@@ -1039,35 +1268,10 @@ async function buildReviewPrompt(
  */
 function getUserFacingHint(target: ReviewTarget): string {
   switch (target.type) {
-    case "uncommitted":
-      return "current changes";
     case "baseBranch":
       return `changes against '${target.branch}'`;
-    case "commit": {
-      const shortSha = target.sha.slice(0, 7);
-      return target.title
-        ? `commit ${shortSha}: ${target.title}`
-        : `commit ${shortSha}`;
-    }
-    case "custom":
-      return target.instructions.length > 40
-        ? target.instructions.slice(0, 37) + "..."
-        : target.instructions;
-
-    case "pullRequest": {
-      const shortTitle =
-        target.title.length > 30
-          ? target.title.slice(0, 27) + "..."
-          : target.title;
-      return `PR #${target.prNumber}: ${shortTitle}`;
-    }
-
-    case "folder": {
-      const joined = target.paths.join(", ");
-      return joined.length > 40
-        ? `folders: ${joined.slice(0, 37)}...`
-        : `folders: ${joined}`;
-    }
+    case "worktree":
+      return `${target.label} vs '${target.baseBranch}'`;
   }
 }
 
@@ -1152,27 +1356,20 @@ async function waitForLoopTurnToStart(
 // Review preset options for the selector (keep this order stable)
 const REVIEW_PRESETS = [
   {
-    value: "uncommitted",
-    label: "Review uncommitted changes",
-    description: "",
-  },
-  {
     value: "baseBranch",
     label: "Review against a base branch",
-    description: "(local)",
+    description: "(local, current branch)",
   },
-  { value: "commit", label: "Review a commit", description: "" },
+  {
+    value: "worktree",
+    label: "Review a worktree against a branch",
+    description: "(local or remote, isolated)",
+  },
   {
     value: "pullRequest",
     label: "Review a pull request",
-    description: "(GitHub PR)",
+    description: "(GitHub PR, isolated)",
   },
-  {
-    value: "folder",
-    label: "Review a folder (or more)",
-    description: "(snapshot, not diff)",
-  },
-  { value: "custom", label: "Custom review instructions", description: "" },
 ] as const;
 
 const TOGGLE_LOOP_FIXING_VALUE = "toggleLoopFixing" as const;
@@ -1303,6 +1500,13 @@ export default function reviewExtension(pi: ExtensionAPI) {
   pi.on("session_start", async (event, ctx) => {
     debugLog(`event session_start reason=${event.reason}`);
     await applyAllReviewState(ctx);
+    // Orphan sweep: when we're NOT resuming an active review, remove any
+    // worktrees a previous (crashed/interrupted) review left behind for this
+    // repo. applyAllReviewState set reviewOriginId above if a review is active.
+    if (!reviewOriginId) {
+      const repoRoot = await getRepoRoot(pi);
+      if (repoRoot) await cleanupReviewWorktrees(pi, repoRoot);
+    }
   });
 
   pi.on("session_tree", async (_event, ctx) => {
@@ -1530,23 +1734,15 @@ export default function reviewExtension(pi: ExtensionAPI) {
   /**
    * Determine the smart default review type based on git state
    */
-  async function getSmartDefault(): Promise<
-    "uncommitted" | "baseBranch" | "commit"
-  > {
-    // Priority 1: If there are uncommitted changes, default to reviewing them
-    if (await hasUncommittedChanges(pi)) {
-      return "uncommitted";
-    }
-
-    // Priority 2: If on a feature branch (not the default branch), default to PR-style review
+  async function getSmartDefault(): Promise<"baseBranch" | "worktree"> {
+    // On a feature branch → review the current branch in place. On the default
+    // branch there's nothing local to diff, so default to the worktree picker.
     const currentBranch = await getCurrentBranch(pi);
     const defaultBranch = await getDefaultBranch(pi);
     if (currentBranch && currentBranch !== defaultBranch) {
       return "baseBranch";
     }
-
-    // Priority 3: Default to reviewing a specific commit
-    return "commit";
+    return "worktree";
   }
 
   /**
@@ -1717,36 +1913,14 @@ export default function reviewExtension(pi: ExtensionAPI) {
 
       // Handle each preset type
       switch (result) {
-        case "uncommitted":
-          return { type: "uncommitted" };
-
         case "baseBranch": {
           const target = await showBranchSelector(ctx);
           if (target) return target;
           break;
         }
 
-        case "commit": {
-          if (reviewLoopFixingEnabled) {
-            ctx.ui.notify(
-              "Loop mode does not work with commit review.",
-              "error",
-            );
-            break;
-          }
-          const target = await showCommitSelector(ctx);
-          if (target) return target;
-          break;
-        }
-
-        case "custom": {
-          const target = await showCustomInput(ctx);
-          if (target) return target;
-          break;
-        }
-
-        case "folder": {
-          const target = await showFolderInput(ctx);
+        case "worktree": {
+          const target = await showWorktreeReviewFlow(ctx);
           if (target) return target;
           break;
         }
@@ -1903,188 +2077,196 @@ export default function reviewExtension(pi: ExtensionAPI) {
   }
 
   /**
-   * Show commit selector
+   * Generic fuzzy single-select over a list of items. Returns the chosen
+   * item.value, or null on cancel. Shared UI for the branch/ref pickers.
    */
-  async function showCommitSelector(
+  async function fuzzySelect(
     ctx: ExtensionContext,
-  ): Promise<ReviewTarget | null> {
-    const commits = await getRecentCommits(pi, 20);
+    title: string,
+    items: SelectItem[],
+    noMatchLabel: string,
+  ): Promise<string | null> {
+    if (items.length === 0) return null;
+    return ctx.ui.custom<string | null>((tui, theme, keybindings, done) => {
+      const container = new Container();
+      container.addChild(new DynamicBorder((str) => theme.fg("accent", str)));
+      container.addChild(new Text(theme.fg("accent", theme.bold(title))));
 
-    if (commits.length === 0) {
-      ctx.ui.notify("No commits found", "error");
-      return null;
-    }
+      const searchInput = new Input();
+      container.addChild(searchInput);
+      container.addChild(new Spacer(1));
 
-    const items: SelectItem[] = commits.map((commit) => ({
-      value: commit.sha,
-      label: `${commit.sha.slice(0, 7)} ${commit.title}`,
-      description: "",
-    }));
+      const listContainer = new Container();
+      container.addChild(listContainer);
+      container.addChild(
+        new Text(
+          theme.fg("dim", "Type to filter • enter to select • esc to cancel"),
+        ),
+      );
+      container.addChild(new DynamicBorder((str) => theme.fg("accent", str)));
 
-    const result = await ctx.ui.custom<{ sha: string; title: string } | null>(
-      (tui, theme, keybindings, done) => {
-        const container = new Container();
-        container.addChild(new DynamicBorder((str) => theme.fg("accent", str)));
-        container.addChild(
-          new Text(theme.fg("accent", theme.bold("Select commit to review"))),
+      let filteredItems = items;
+      let selectList: SelectList | null = null;
+
+      const updateList = () => {
+        listContainer.clear();
+        if (filteredItems.length === 0) {
+          listContainer.addChild(
+            new Text(theme.fg("warning", `  ${noMatchLabel}`)),
+          );
+          selectList = null;
+          return;
+        }
+
+        selectList = new SelectList(
+          filteredItems,
+          Math.min(filteredItems.length, 10),
+          {
+            selectedPrefix: (text) => theme.fg("accent", text),
+            selectedText: (text) => theme.fg("accent", text),
+            description: (text) => theme.fg("muted", text),
+            scrollInfo: (text) => theme.fg("dim", text),
+            noMatch: (text) => theme.fg("warning", text),
+          },
         );
 
-        const searchInput = new Input();
-        container.addChild(searchInput);
-        container.addChild(new Spacer(1));
+        selectList.onSelect = (item) => done(item.value);
+        selectList.onCancel = () => done(null);
+        listContainer.addChild(selectList);
+      };
 
-        const listContainer = new Container();
-        container.addChild(listContainer);
-        container.addChild(
-          new Text(
-            theme.fg("dim", "Type to filter • enter to select • esc to cancel"),
-          ),
-        );
-        container.addChild(new DynamicBorder((str) => theme.fg("accent", str)));
+      const applyFilter = () => {
+        const query = searchInput.getValue();
+        filteredItems = query
+          ? fuzzyFilter(
+              items,
+              query,
+              (item) => `${item.label} ${item.value} ${item.description ?? ""}`,
+            )
+          : items;
+        updateList();
+      };
 
-        let filteredItems = items;
-        let selectList: SelectList | null = null;
+      applyFilter();
 
-        const updateList = () => {
-          listContainer.clear();
-          if (filteredItems.length === 0) {
-            listContainer.addChild(
-              new Text(theme.fg("warning", "  No matching commits")),
-            );
-            selectList = null;
+      return {
+        render(width: number) {
+          return container.render(width);
+        },
+        invalidate() {
+          container.invalidate();
+        },
+        handleInput(data: string) {
+          if (
+            keybindings.matches(data, "tui.select.up") ||
+            keybindings.matches(data, "tui.select.down") ||
+            keybindings.matches(data, "tui.select.confirm") ||
+            keybindings.matches(data, "tui.select.cancel")
+          ) {
+            if (selectList) {
+              selectList.handleInput(data);
+            } else if (keybindings.matches(data, "tui.select.cancel")) {
+              done(null);
+            }
+            tui.requestRender();
             return;
           }
 
-          selectList = new SelectList(
-            filteredItems,
-            Math.min(filteredItems.length, 10),
-            {
-              selectedPrefix: (text) => theme.fg("accent", text),
-              selectedText: (text) => theme.fg("accent", text),
-              description: (text) => theme.fg("muted", text),
-              scrollInfo: (text) => theme.fg("dim", text),
-              noMatch: (text) => theme.fg("warning", text),
-            },
-          );
-
-          selectList.onSelect = (item) => {
-            const commit = commits.find((c) => c.sha === item.value);
-            if (commit) {
-              done(commit);
-            } else {
-              done(null);
-            }
-          };
-          selectList.onCancel = () => done(null);
-          listContainer.addChild(selectList);
-        };
-
-        const applyFilter = () => {
-          const query = searchInput.getValue();
-          filteredItems = query
-            ? fuzzyFilter(
-                items,
-                query,
-                (item) =>
-                  `${item.label} ${item.value} ${item.description ?? ""}`,
-              )
-            : items;
-          updateList();
-        };
-
-        applyFilter();
-
-        return {
-          render(width: number) {
-            return container.render(width);
-          },
-          invalidate() {
-            container.invalidate();
-          },
-          handleInput(data: string) {
-            if (
-              keybindings.matches(data, "tui.select.up") ||
-              keybindings.matches(data, "tui.select.down") ||
-              keybindings.matches(data, "tui.select.confirm") ||
-              keybindings.matches(data, "tui.select.cancel")
-            ) {
-              if (selectList) {
-                selectList.handleInput(data);
-              } else if (keybindings.matches(data, "tui.select.cancel")) {
-                done(null);
-              }
-              tui.requestRender();
-              return;
-            }
-
-            searchInput.handleInput(data);
-            applyFilter();
-            tui.requestRender();
-          },
-        };
-      },
-    );
-
-    if (!result) return null;
-    return { type: "commit", sha: result.sha, title: result.title };
+          searchInput.handleInput(data);
+          applyFilter();
+          tui.requestRender();
+        },
+      };
+    });
   }
 
   /**
-   * Show custom instructions input
+   * Unified picker for the branch/ref to review: local heads + remote-tracking
+   * branches. Returns the chosen ref (e.g. "feature-x" or "origin/feature-x").
    */
-  async function showCustomInput(
+  async function showRefSelector(
+    ctx: ExtensionContext,
+  ): Promise<string | null> {
+    const refs = await getAllBranchRefs(pi);
+    if (refs.length === 0) {
+      ctx.ui.notify("No branches found", "error");
+      return null;
+    }
+    const items: SelectItem[] = refs.map((ref) => ({
+      value: ref,
+      label: ref,
+      description: ref.includes("/") ? "(remote)" : "",
+    }));
+    return fuzzySelect(
+      ctx,
+      "Select branch to review (local or remote)",
+      items,
+      "No matching branches",
+    );
+  }
+
+  /**
+   * Pick the base branch to diff against (local branches, default first).
+   */
+  async function pickBaseBranch(
+    ctx: ExtensionContext,
+    excludeRef?: string,
+  ): Promise<string | null> {
+    const branches = await getLocalBranches(pi);
+    const defaultBranch = await getDefaultBranch(pi);
+    const candidates = branches
+      .filter((b) => b !== excludeRef)
+      .sort((a, b) => {
+        if (a === defaultBranch) return -1;
+        if (b === defaultBranch) return 1;
+        return a.localeCompare(b);
+      });
+    if (candidates.length === 0) {
+      ctx.ui.notify("No base branches found", "error");
+      return null;
+    }
+    const items: SelectItem[] = candidates.map((b) => ({
+      value: b,
+      label: b,
+      description: b === defaultBranch ? "(default)" : "",
+    }));
+    return fuzzySelect(
+      ctx,
+      "Select base branch",
+      items,
+      "No matching branches",
+    );
+  }
+
+  /**
+   * Worktree review flow: pick a (local/remote) branch + base branch, then
+   * materialize an isolated worktree to review against the base.
+   */
+  async function showWorktreeReviewFlow(
     ctx: ExtensionContext,
   ): Promise<ReviewTarget | null> {
-    const result = await ctx.ui.editor(
-      "Enter review instructions:",
-      "Review the code for security vulnerabilities and potential bugs...",
-    );
+    const reviewRef = await showRefSelector(ctx);
+    if (!reviewRef) return null;
 
-    if (!result?.trim()) return null;
-    return { type: "custom", instructions: result.trim() };
-  }
+    const baseBranch = await pickBaseBranch(ctx, reviewRef);
+    if (!baseBranch) return null;
 
-  function parseReviewPaths(value: string): string[] {
-    return value
-      .split(/\s+/)
-      .map((item) => item.trim())
-      .filter((item) => item.length > 0);
-  }
-
-  /**
-   * Show folder input
-   */
-  async function showFolderInput(
-    ctx: ExtensionContext,
-  ): Promise<ReviewTarget | null> {
-    const result = await ctx.ui.editor(
-      "Enter folders/files to review (space-separated or one per line):",
-      ".",
-    );
-
-    if (!result?.trim()) return null;
-    const paths = parseReviewPaths(result);
-    if (paths.length === 0) return null;
-
-    return { type: "folder", paths };
+    ctx.ui.notify(`Materializing worktree for '${reviewRef}'...`, "info");
+    const result = await materializeWorktree(pi, reviewRef, baseBranch);
+    if (!result.ok) {
+      ctx.ui.notify(`Could not set up worktree: ${result.error}`, "error");
+      return null;
+    }
+    ctx.ui.notify(`Reviewing ${result.target.label}`, "info");
+    return result.target;
   }
 
   /**
-   * Show PR input and handle checkout
+   * Show PR input and materialize an isolated worktree for the PR.
    */
   async function showPrInput(
     ctx: ExtensionContext,
   ): Promise<ReviewTarget | null> {
-    // First check for pending changes that would prevent branch switching
-    if (await hasPendingChanges(pi)) {
-      ctx.ui.notify(
-        "Cannot checkout PR: you have uncommitted changes. Please commit or stash them first.",
-        "error",
-      );
-      return null;
-    }
-
-    // Get PR reference from user
     const prRef = await ctx.ui.editor(
       "Enter PR number or URL (e.g. 123 or https://github.com/owner/repo/pull/123):",
       "",
@@ -2101,44 +2283,21 @@ export default function reviewExtension(pi: ExtensionAPI) {
       return null;
     }
 
-    // Get PR info from GitHub
-    ctx.ui.notify(`Fetching PR #${prNumber} info...`, "info");
-    const prInfo = await getPrInfo(pi, prNumber);
-
-    if (!prInfo) {
+    ctx.ui.notify(
+      `Fetching PR #${prNumber} into an isolated worktree...`,
+      "info",
+    );
+    const result = await materializePrWorktree(pi, prNumber);
+    if (!result.ok) {
       ctx.ui.notify(
-        `Could not find PR #${prNumber}. Make sure gh is authenticated and the PR exists.`,
+        `Could not review PR #${prNumber}: ${result.error}`,
         "error",
       );
       return null;
     }
 
-    // Check again for pending changes (in case something changed)
-    if (await hasPendingChanges(pi)) {
-      ctx.ui.notify(
-        "Cannot checkout PR: you have uncommitted changes. Please commit or stash them first.",
-        "error",
-      );
-      return null;
-    }
-
-    // Checkout the PR
-    ctx.ui.notify(`Checking out PR #${prNumber}...`, "info");
-    const checkoutResult = await checkoutPr(pi, prNumber);
-
-    if (!checkoutResult.success) {
-      ctx.ui.notify(`Failed to checkout PR: ${checkoutResult.error}`, "error");
-      return null;
-    }
-
-    ctx.ui.notify(`Checked out PR #${prNumber} (${prInfo.headBranch})`, "info");
-
-    return {
-      type: "pullRequest",
-      prNumber,
-      baseBranch: prInfo.baseBranch,
-      title: prInfo.title,
-    };
+    ctx.ui.notify(`Reviewing ${result.target.label}`, "info");
+    return result.target;
   }
 
   /**
@@ -2272,39 +2431,27 @@ export default function reviewExtension(pi: ExtensionAPI) {
    */
   function parseArgs(
     args: string | undefined,
-  ): ReviewTarget | { type: "pr"; ref: string } | null {
+  ):
+    | ReviewTarget
+    | { type: "pr"; ref: string }
+    | { type: "worktreeCli"; ref: string; base?: string }
+    | null {
     if (!args?.trim()) return null;
 
     const parts = args.trim().split(/\s+/);
     const subcommand = parts[0]?.toLowerCase();
 
     switch (subcommand) {
-      case "uncommitted":
-        return { type: "uncommitted" };
-
       case "branch": {
         const branch = parts[1];
         if (!branch) return null;
         return { type: "baseBranch", branch };
       }
 
-      case "commit": {
-        const sha = parts[1];
-        if (!sha) return null;
-        const title = parts.slice(2).join(" ") || undefined;
-        return { type: "commit", sha, title };
-      }
-
-      case "custom": {
-        const instructions = parts.slice(1).join(" ");
-        if (!instructions) return null;
-        return { type: "custom", instructions };
-      }
-
-      case "folder": {
-        const paths = parseReviewPaths(parts.slice(1).join(" "));
-        if (paths.length === 0) return null;
-        return { type: "folder", paths };
+      case "worktree": {
+        const ref = parts[1];
+        if (!ref) return null;
+        return { type: "worktreeCli", ref, base: parts[2] };
       }
 
       case "pr": {
@@ -2319,21 +2466,12 @@ export default function reviewExtension(pi: ExtensionAPI) {
   }
 
   /**
-   * Handle PR checkout and return a ReviewTarget (or null on failure)
+   * Materialize an isolated worktree for a PR ref and return a ReviewTarget.
    */
   async function handlePrCheckout(
     ctx: ExtensionContext,
     ref: string,
   ): Promise<ReviewTarget | null> {
-    // First check for pending changes
-    if (await hasPendingChanges(pi)) {
-      ctx.ui.notify(
-        "Cannot checkout PR: you have uncommitted changes. Please commit or stash them first.",
-        "error",
-      );
-      return null;
-    }
-
     const prNumber = parsePrReference(ref);
     if (!prNumber) {
       ctx.ui.notify(
@@ -2343,43 +2481,45 @@ export default function reviewExtension(pi: ExtensionAPI) {
       return null;
     }
 
-    // Get PR info
-    ctx.ui.notify(`Fetching PR #${prNumber} info...`, "info");
-    const prInfo = await getPrInfo(pi, prNumber);
-
-    if (!prInfo) {
+    ctx.ui.notify(
+      `Fetching PR #${prNumber} into an isolated worktree...`,
+      "info",
+    );
+    const result = await materializePrWorktree(pi, prNumber);
+    if (!result.ok) {
       ctx.ui.notify(
-        `Could not find PR #${prNumber}. Make sure gh is authenticated and the PR exists.`,
+        `Could not review PR #${prNumber}: ${result.error}`,
         "error",
       );
       return null;
     }
+    ctx.ui.notify(`Reviewing ${result.target.label}`, "info");
+    return result.target;
+  }
 
-    // Checkout the PR
-    ctx.ui.notify(`Checking out PR #${prNumber}...`, "info");
-    const checkoutResult = await checkoutPr(pi, prNumber);
-
-    if (!checkoutResult.success) {
-      ctx.ui.notify(`Failed to checkout PR: ${checkoutResult.error}`, "error");
+  /**
+   * Materialize an isolated worktree for a branch ref (CLI path).
+   */
+  async function handleWorktreeCli(
+    ctx: ExtensionContext,
+    ref: string,
+    base?: string,
+  ): Promise<ReviewTarget | null> {
+    const baseBranch = base ?? (await getDefaultBranch(pi));
+    ctx.ui.notify(`Materializing worktree for '${ref}'...`, "info");
+    const result = await materializeWorktree(pi, ref, baseBranch);
+    if (!result.ok) {
+      ctx.ui.notify(`Could not set up worktree: ${result.error}`, "error");
       return null;
     }
-
-    ctx.ui.notify(`Checked out PR #${prNumber} (${prInfo.headBranch})`, "info");
-
-    return {
-      type: "pullRequest",
-      prNumber,
-      baseBranch: prInfo.baseBranch,
-      title: prInfo.title,
-    };
+    ctx.ui.notify(`Reviewing ${result.target.label}`, "info");
+    return result.target;
   }
 
   function isLoopCompatibleTarget(target: ReviewTarget): boolean {
-    if (target.type !== "commit") {
-      return true;
-    }
-
-    return false;
+    // Only in-place base-branch review supports the fix → re-review loop;
+    // worktree reviews (including PRs) are review-only.
+    return target.type === "baseBranch";
   }
 
   async function runLoopFixingReview(
@@ -2555,7 +2695,7 @@ export default function reviewExtension(pi: ExtensionAPI) {
   // Register the /review command
   pi.registerCommand("review", {
     description:
-      "Review code changes (PR, uncommitted, branch, commit, folder, or custom) with optional ticket compliance (Linear/Jira)",
+      "Review code changes (base branch, a worktree, or a PR) with optional ticket compliance (Linear/Jira)",
     handler: async (args, ctx) => {
       if (!ctx.hasUI) {
         ctx.ui.notify("Review requires interactive mode", "error");
@@ -2590,11 +2730,18 @@ export default function reviewExtension(pi: ExtensionAPI) {
 
       if (parsed) {
         if (parsed.type === "pr") {
-          // Handle PR checkout (async operation)
           target = await handlePrCheckout(ctx, parsed.ref);
           if (!target) {
             ctx.ui.notify(
               "PR review failed. Returning to review menu.",
+              "warning",
+            );
+          }
+        } else if (parsed.type === "worktreeCli") {
+          target = await handleWorktreeCli(ctx, parsed.ref, parsed.base);
+          if (!target) {
+            ctx.ui.notify(
+              "Worktree review failed. Returning to review menu.",
               "warning",
             );
           }
@@ -2619,7 +2766,10 @@ export default function reviewExtension(pi: ExtensionAPI) {
         }
 
         if (reviewLoopFixingEnabled && !isLoopCompatibleTarget(target)) {
-          ctx.ui.notify("Loop mode does not work with commit review.", "error");
+          ctx.ui.notify(
+            "Loop mode only works with base-branch review.",
+            "error",
+          );
           if (fromSelector) {
             target = null;
             continue;
@@ -2741,6 +2891,12 @@ Instructions:
     pi.appendEntry(REVIEW_STATE_TYPE, { active: false });
   }
 
+  // Remove any worktrees this review materialized for the current repo.
+  async function cleanupReviewWorktreesForRepo(): Promise<void> {
+    const repoRoot = await getRepoRoot(pi);
+    if (repoRoot) await cleanupReviewWorktrees(pi, repoRoot);
+  }
+
   async function navigateWithSummary(
     ctx: ExtensionCommandContext,
     originId: string,
@@ -2826,6 +2982,7 @@ Instructions:
       }
 
       clearReviewState(ctx);
+      await cleanupReviewWorktreesForRepo();
       if (notifySuccess) {
         ctx.ui.notify(
           "Review complete! Returned to original position.",
@@ -2862,6 +3019,7 @@ Instructions:
     }
 
     clearReviewState(ctx);
+    await cleanupReviewWorktreesForRepo();
 
     if (action === "returnAndSummarize") {
       if (!ctx.ui.getEditorText().trim()) {
