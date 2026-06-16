@@ -6,7 +6,8 @@ Based on the original [review extension](https://github.com/mitsuhiko/agent-stuf
 
 ## What it does
 
-- Interactive code review with multiple modes (uncommitted, branch, PR, commit, folder, custom)
+- Interactive code review against a base branch — the current branch in place, any local/remote branch in an isolated worktree, or a GitHub PR
+- Worktree & PR reviews are materialized on demand (fetched if remote) into a throwaway git worktree that never touches your working tree, and are removed at `/end-review`
 - Ticket compliance checking for **Linear** and **Jira** (inferred from branch name or HEAD commit)
 - Loop fixing mode — automatically cycles review → fix → re-review until no blocking findings remain
 - Send review findings to Claude's tmux pane for cross-agent workflows
@@ -24,12 +25,9 @@ Requires `@earendil-works/pi-ai` and `@earendil-works/pi-coding-agent` >= 0.49.0
 ## Usage
 
 - `/review` — open the interactive review selector
-- `/review uncommitted` — review uncommitted changes
-- `/review branch main` — review against a base branch
-- `/review pr 123` — checkout and review a GitHub PR
-- `/review commit abc123` — review a specific commit
-- `/review folder src docs` — snapshot review of paths
-- `/review custom "check for security issues"` — custom instructions
+- `/review branch main` — review the current branch against a base branch
+- `/review worktree feature-x main` — review branch `feature-x` against `main` in an isolated worktree (fetches it first if remote-only)
+- `/review pr 123` — review a GitHub PR in an isolated worktree
 
 ### Toggles in the selector
 
