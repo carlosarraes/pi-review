@@ -71,6 +71,9 @@ let reviewTicketComplianceEnabled = false;
 let reviewTicketProvider: "linear" | "jira" = "linear";
 let reviewInferredTicketId: string | undefined = undefined;
 let reviewDestination: ReviewDestination = "none";
+// Identifies the PR/branch to publish to when the destination is "github".
+// Set per-review in executeReview; read in the turn_end GitHub path.
+let reviewPostContext: { prNumber?: number; branch?: string } = {};
 
 const REVIEW_STATE_TYPE = "review-session";
 const REVIEW_ANCHOR_TYPE = "review-anchor";
@@ -336,10 +339,13 @@ type ReviewTarget =
       type: "worktree";
       worktreePath: string;
       reviewSha: string;
+      // Branch under review: the PR head branch, or the picked ref for a branch
+      // review. Used for ticket inference and locating the PR when posting.
+      reviewBranch: string;
       baseBranch: string;
       mergeBaseSha: string | null;
       label: string;
-      pr?: { number: number };
+      pr?: { number: number; title: string };
       // Set only for PRs: the fetched ref (refs/pi-review/pr-<n>) to delete on cleanup.
       tempRef?: string;
     };
@@ -615,23 +621,25 @@ async function getHeadCommitTitle(pi: ExtensionAPI): Promise<string | null> {
 async function inferTicketId(
   pi: ExtensionAPI,
   provider: "linear" | "jira",
+  target?: ReviewTarget,
 ): Promise<string | undefined> {
-  const currentBranch = await getCurrentBranch(pi);
-  const branchTicket = currentBranch
-    ? extractTicketId(currentBranch, provider)
-    : undefined;
-  if (branchTicket) {
-    return branchTicket;
+  // For an isolated worktree/PR review, infer from the work under review (PR
+  // head branch / title), NOT the local branch the user happens to be on.
+  const candidates: string[] = [];
+  if (target?.type === "worktree") {
+    candidates.push(target.reviewBranch);
+    if (target.pr?.title) candidates.push(target.pr.title);
+  } else {
+    const currentBranch = await getCurrentBranch(pi);
+    if (currentBranch) candidates.push(currentBranch);
+    const headCommitTitle = await getHeadCommitTitle(pi);
+    if (headCommitTitle) candidates.push(headCommitTitle);
   }
 
-  const headCommitTitle = await getHeadCommitTitle(pi);
-  const commitTicket = headCommitTitle
-    ? extractTicketId(headCommitTitle, provider)
-    : undefined;
-  if (commitTicket) {
-    return commitTicket;
+  for (const candidate of candidates) {
+    const id = extractTicketId(candidate, provider);
+    if (id) return id;
   }
-
   return undefined;
 }
 
@@ -775,10 +783,11 @@ async function createWorktreeTarget(
   opts: {
     repoRoot: string;
     ref: string;
+    reviewBranch: string;
     sha: string;
     baseBranch: string;
     label: string;
-    pr?: { number: number };
+    pr?: { number: number; title: string };
     tempRef?: string;
   },
 ): Promise<MaterializeResult> {
@@ -806,16 +815,24 @@ async function createWorktreeTarget(
     createdAt: new Date().toISOString(),
   });
 
-  // The base branch may exist only on the remote (common for PRs reviewed in a
-  // repo without a local checkout of the base). Fall back to origin/<base> so
-  // the merge base is pre-computed rather than deferred to the model.
-  let mergeBaseSha = await getMergeBaseBetween(pi, opts.sha, opts.baseBranch);
-  if (!mergeBaseSha && !opts.baseBranch.includes("/")) {
-    mergeBaseSha = await getMergeBaseBetween(
-      pi,
-      opts.sha,
-      `origin/${opts.baseBranch}`,
-    );
+  // Diff against the up-to-date remote base, not a possibly-stale local copy.
+  // Fetch origin/<base> (best-effort) and prefer it; fall back to the local
+  // base only when there's no remote counterpart (e.g. a purely-local branch).
+  const qualifiedBase = opts.baseBranch.includes("/");
+  if (!qualifiedBase) {
+    await pi.exec("git", [
+      "-C",
+      opts.repoRoot,
+      "fetch",
+      "origin",
+      opts.baseBranch,
+    ]);
+  }
+  let mergeBaseSha = qualifiedBase
+    ? null
+    : await getMergeBaseBetween(pi, opts.sha, `origin/${opts.baseBranch}`);
+  if (!mergeBaseSha) {
+    mergeBaseSha = await getMergeBaseBetween(pi, opts.sha, opts.baseBranch);
   }
 
   return {
@@ -824,6 +841,7 @@ async function createWorktreeTarget(
       type: "worktree",
       worktreePath,
       reviewSha: opts.sha,
+      reviewBranch: opts.reviewBranch,
       baseBranch: opts.baseBranch,
       mergeBaseSha,
       label: opts.label,
@@ -892,6 +910,7 @@ async function materializeWorktree(
   return createWorktreeTarget(pi, {
     repoRoot,
     ref: reviewRef,
+    reviewBranch: reviewRef,
     sha: resolved.sha,
     baseBranch,
     label: `branch '${reviewRef}'`,
@@ -940,10 +959,11 @@ async function materializePrWorktree(
   return createWorktreeTarget(pi, {
     repoRoot,
     ref: `pr-${prNumber}`,
+    reviewBranch: info.headBranch,
     sha: sha.trim(),
     baseBranch: info.baseBranch,
     label: `PR #${prNumber} ("${info.title}")`,
-    pr: { number: prNumber },
+    pr: { number: prNumber, title: info.title },
     tempRef,
   });
 }
@@ -1129,8 +1149,13 @@ export default function reviewExtension(pi: ExtensionAPI) {
 
   async function refreshInferredTicket(
     ctx?: ExtensionContext,
+    target?: ReviewTarget,
   ): Promise<string | undefined> {
-    reviewInferredTicketId = await inferTicketId(pi, reviewTicketProvider);
+    reviewInferredTicketId = await inferTicketId(
+      pi,
+      reviewTicketProvider,
+      target,
+    );
     if (ctx && reviewOriginId) {
       setReviewWidget(ctx, true);
     }
@@ -1141,7 +1166,11 @@ export default function reviewExtension(pi: ExtensionAPI) {
     const settings = await getReviewSettings(ctx);
     await applyReviewSettings(ctx);
     applyReviewState(ctx);
-    const inferredId = await refreshInferredTicket(ctx);
+    // Don't re-infer from the local branch while a review is active — it would
+    // clobber the target-aware ticket the running review already resolved.
+    const inferredId = reviewOriginId
+      ? reviewInferredTicketId
+      : await refreshInferredTicket(ctx);
 
     if (settings.ticketComplianceEnabled === undefined && inferredId) {
       setTicketComplianceEnabled(true);
@@ -1393,18 +1422,28 @@ export default function reviewExtension(pi: ExtensionAPI) {
     });
   }
 
-  function postFindingsToGitHub(): void {
-    // The model already has the findings in context from the review turn; ask
-    // it to publish them to the PR. It resolves the PR itself (works for
-    // branch, worktree, and PR targets). Publish-only — no loop, no edits.
+  function postFindingsToGitHub(context: {
+    prNumber?: number;
+    branch?: string;
+  }): void {
+    // The model has the findings in context from the review turn; ask it to
+    // publish them to the PR. We hand it the PR number (PR reviews) or the
+    // branch name (worktree reviews) because the review worktree is DETACHED —
+    // `git branch --show-current` there is empty. Publish-only, no loop.
+    const locate = context.prNumber
+      ? `The pull request is #${context.prNumber}.`
+      : context.branch
+        ? `Find the open PR for branch \`${context.branch}\` (e.g. \`gh pr view ${context.branch} --json number\`).`
+        : `Find the open PR for the current branch (e.g. \`gh pr view --json number\`).`;
     const prompt = `Publish the code review findings above to the matching GitHub pull request using \`gh api\`.
 
-1. Find the PR for the branch you just reviewed (e.g. \`gh pr view <branch> --json number,headRefName\`; for a worktree review it is the branch checked out in that worktree). If there is no open PR, stop and say so — do not create one.
-2. Add an inline review comment for each actionable finding, anchored to the file and line in the PR diff.
-3. Submit the review in the same call:
+${locate} If there is no open PR, stop and say so — do not create one. The review ran in a detached worktree, so do NOT use \`git branch --show-current\` to find it.
+
+1. Add an inline review comment for each actionable finding, anchored to the file and line in the PR diff.
+2. Submit the review in the same call:
    - verdict "needs attention" (blocking findings) -> event REQUEST_CHANGES
    - verdict "correct" (no blocking findings) -> event APPROVE
-4. Report the PR number, the event submitted, and how many comments you posted.
+3. Report the PR number, the event submitted, and how many comments you posted.
 
 Do not modify any code. This is a publish-only step.`;
     pi.sendUserMessage(prompt, { deliverAs: "followUp" });
@@ -1441,7 +1480,7 @@ Do not modify any code. This is a publish-only step.`;
     } else if (reviewDestination === "pi") {
       await sendFindingsToPi(text, ctx);
     } else if (reviewDestination === "github") {
-      postFindingsToGitHub();
+      postFindingsToGitHub(reviewPostContext);
     }
   });
 
@@ -2073,10 +2112,36 @@ Do not modify any code. This is a publish-only step.`;
       });
     }
 
-    const ticketId = reviewTicketComplianceEnabled
-      ? await refreshInferredTicket(ctx)
-      : undefined;
+    // Remember where a "post to GitHub" follow-up should publish (the review
+    // worktree is detached, so the model can't discover this itself).
+    reviewPostContext =
+      target.type === "worktree"
+        ? { prNumber: target.pr?.number, branch: target.reviewBranch }
+        : {};
+
     const providerName = reviewTicketProvider === "jira" ? "Jira" : "Linear";
+    let ticketId = reviewTicketComplianceEnabled
+      ? await refreshInferredTicket(ctx, target)
+      : undefined;
+    // Inference failed but compliance is on — ask for the ticket explicitly
+    // rather than silently dropping compliance.
+    if (reviewTicketComplianceEnabled && !ticketId) {
+      const entered = await ctx.ui.editor(
+        `Could not infer a ${providerName} ticket. Enter the ticket ID for compliance (blank to skip):`,
+        "",
+      );
+      const trimmed = entered?.trim();
+      if (trimmed) {
+        ticketId = trimmed;
+        reviewInferredTicketId = trimmed;
+        setReviewWidget(ctx, true);
+      } else {
+        ctx.ui.notify(
+          `No ${providerName} ticket provided — running a normal review without compliance.`,
+          "warning",
+        );
+      }
+    }
     const prompt = await buildReviewPrompt(pi, target, {
       includeLocalChanges: options?.includeLocalChanges === true,
       ticketId,
@@ -2086,12 +2151,6 @@ Do not modify any code. This is a publish-only step.`;
     const ticketHint = ticketId
       ? ` + ${providerName} ${ticketId} compliance`
       : "";
-    if (reviewTicketComplianceEnabled && !ticketId) {
-      ctx.ui.notify(
-        `${providerName} ticket compliance is enabled, but no ticket could be inferred from the current branch or HEAD commit title. Running a normal review.`,
-        "warning",
-      );
-    }
     const projectGuidelines = await loadProjectReviewGuidelines(ctx.cwd);
     const instructionFilePath = await findProjectInstructionFile(ctx.cwd);
 
