@@ -10,7 +10,8 @@
  *   node review-pr.mjs <pr-number|url> [destination] [options]
  *
  *   destination   github (default) | claude | pi | none
- *   --model <m>   pass a specific model to pi (default: pi's configured model)
+ *   --model <m>   model pattern provider/id:effort
+ *                 (default: openai-codex/gpt-5.5:medium — :medium = medium reasoning effort)
  *   --ext <path>  load ONLY this extension file (for testing local edits
  *                 without touching the installed pi-review). Omit in prod.
  *   --cwd <dir>   run pi in this repo dir (default: current dir)
@@ -78,6 +79,7 @@ const HARD_TIMEOUT_MS = (Number.isFinite(opts.hardMin) ? opts.hardMin : 15) * 60
 const IDLE_TIMEOUT_MS = (Number.isFinite(opts.idleSec) ? opts.idleSec : 180) * 1_000;
 const SETTLE_MS = 5_000; // grace after agent_end for an async followUp to enqueue
 const STATE_REQ_ID = "review-pr-state";
+const LAST_TEXT_ID = "review-pr-last-text";
 
 const log = (...a) => console.error("[review-pr]", ...a);
 const trace = (...a) => {
@@ -92,7 +94,10 @@ const piArgs = ["--mode", "rpc"];
 // --ext loads ONLY the given extension file (so we can test local edits without
 // touching the installed copy). Omit in production to use installed extensions.
 if (opts.ext) piArgs.push("--no-extensions", "--extension", opts.ext);
-if (opts.model) piArgs.push("--model", opts.model);
+// The reviewer always runs on a strong model, independent of pi's interactive
+// default. Pattern is provider/id:effort — :medium is the medium reasoning level.
+const model = opts.model ?? "openai-codex/gpt-5.5:medium";
+piArgs.push("--model", model);
 
 const child = spawn("pi", piArgs, { cwd: CWD, stdio: ["pipe", "pipe", "pipe"] });
 
@@ -117,6 +122,7 @@ let exiting = false;
 let sawAgentEnd = false;
 let settleTimer = null;
 let idleTimer = null;
+let doneMessages = null;
 
 const hardTimer = setTimeout(
   () => finish(1, `hard timeout after ${HARD_TIMEOUT_MS / 60_000} min`),
@@ -247,9 +253,23 @@ attachJsonlReader(child.stdout, (line) => {
     const st = ev.data || {};
     trace(`state: streaming=${st.isStreaming} pending=${st.pendingMessageCount}`);
     if (!st.isStreaming && (st.pendingMessageCount ?? 0) === 0) {
-      finish(0, `complete (messages=${st.messageCount})`);
+      // Idle: grab the final assistant message (the review itself, or the
+      // post confirmation) for visibility, then finish.
+      doneMessages = st.messageCount;
+      send({ id: LAST_TEXT_ID, type: "get_last_assistant_text" });
     }
     // Otherwise a followUp (the GitHub post) is queued or running — keep going.
+    return;
+  }
+
+  if (ev.type === "response" && ev.id === LAST_TEXT_ID && ev.command === "get_last_assistant_text") {
+    const text = ev.data?.text;
+    if (text) {
+      process.stdout.write(
+        `\n===== final assistant message =====\n${text}\n===================================\n`,
+      );
+    }
+    finish(0, `complete (messages=${doneMessages ?? "?"})`);
     return;
   }
 
@@ -292,5 +312,5 @@ child.on("exit", (code) => {
 
 bumpIdle();
 const command = `/review pr ${PR} ${DEST} --empty`;
-log(`PR #${PR}: starting "${command}" (cwd=${CWD})`);
+log(`PR #${PR}: starting "${command}" (model=${model}, cwd=${CWD})`);
 send({ type: "prompt", message: command });
