@@ -2035,7 +2035,7 @@ Do not modify any code. This is a publish-only step.`;
     ctx: ExtensionCommandContext,
     target: ReviewTarget,
     useFreshSession: boolean,
-    options?: { includeLocalChanges?: boolean },
+    options?: { includeLocalChanges?: boolean; headless?: boolean },
   ): Promise<boolean> {
     // Check if we're already in a review
     if (reviewOriginId) {
@@ -2125,7 +2125,7 @@ Do not modify any code. This is a publish-only step.`;
       : undefined;
     // Inference failed but compliance is on — ask for the ticket explicitly
     // rather than silently dropping compliance.
-    if (reviewTicketComplianceEnabled && !ticketId) {
+    if (reviewTicketComplianceEnabled && !ticketId && !options?.headless) {
       const entered = await ctx.ui.editor(
         `Could not infer a ${providerName} ticket. Enter the ticket ID for compliance (blank to skip):`,
         "",
@@ -2174,38 +2174,88 @@ Do not modify any code. This is a publish-only step.`;
   }
 
   /**
-   * Parse command arguments for direct invocation
-   * Returns the target or a special marker for PR that needs async handling
+   * Parse command arguments for direct invocation.
+   *
+   * Grammar: <subcommand> <positional...> [destination] [--empty]
+   *   branch   <baseBranch>      [github|claude|pi|none] [--empty]
+   *   worktree <ref> [baseBranch] [github|claude|pi|none] [--empty]
+   *   pr       <number|url>      [github|claude|pi|none] [--empty]
+   *
+   * The optional destination + --empty flag let a fully-specified invocation
+   * run with no interactive prompts (headless). Returns the resolved target
+   * plus those flags, or null when there are no args.
    */
-  function parseArgs(
-    args: string | undefined,
-  ):
-    | ReviewTarget
-    | { type: "pr"; ref: string }
-    | { type: "worktreeCli"; ref: string; base?: string }
-    | null {
+  function parseArgs(args: string | undefined): {
+    target:
+      | ReviewTarget
+      | { type: "pr"; ref: string }
+      | { type: "worktreeCli"; ref: string; base?: string };
+    destination?: ReviewDestination;
+    empty?: boolean;
+  } | null {
     if (!args?.trim()) return null;
 
     const parts = args.trim().split(/\s+/);
     const subcommand = parts[0]?.toLowerCase();
 
+    // Pull the headless flags (a known destination token + --empty) out of the
+    // trailing tokens, leaving the subcommand's positional args behind.
+    const extractFlags = (
+      tokens: string[],
+    ): { destination?: ReviewDestination; empty: boolean; rest: string[] } => {
+      let destination: ReviewDestination | undefined;
+      let empty = false;
+      const rest: string[] = [];
+      for (const tok of tokens) {
+        const low = tok.toLowerCase();
+        if (low === "--empty" || low === "empty") {
+          empty = true;
+        } else if (
+          low === "github" ||
+          low === "claude" ||
+          low === "pi" ||
+          low === "none"
+        ) {
+          destination = low as ReviewDestination;
+        } else {
+          rest.push(tok);
+        }
+      }
+      return { destination, empty, rest };
+    };
+
     switch (subcommand) {
       case "branch": {
         const branch = parts[1];
         if (!branch) return null;
-        return { type: "baseBranch", branch };
+        const f = extractFlags(parts.slice(2));
+        return {
+          target: { type: "baseBranch", branch },
+          destination: f.destination,
+          empty: f.empty,
+        };
       }
 
       case "worktree": {
         const ref = parts[1];
         if (!ref) return null;
-        return { type: "worktreeCli", ref, base: parts[2] };
+        const f = extractFlags(parts.slice(2));
+        return {
+          target: { type: "worktreeCli", ref, base: f.rest[0] },
+          destination: f.destination,
+          empty: f.empty,
+        };
       }
 
       case "pr": {
         const ref = parts[1];
         if (!ref) return null;
-        return { type: "pr", ref };
+        const f = extractFlags(parts.slice(2));
+        return {
+          target: { type: "pr", ref },
+          destination: f.destination,
+          empty: f.empty,
+        };
       }
 
       default:
@@ -2269,11 +2319,6 @@ Do not modify any code. This is a publish-only step.`;
     description:
       "Review code changes (base branch, a worktree, or a PR) with optional ticket compliance (Linear/Jira)",
     handler: async (args, ctx) => {
-      if (!ctx.hasUI) {
-        ctx.ui.notify("Review requires interactive mode", "error");
-        return;
-      }
-
       // Check if we're already in a review
       if (reviewOriginId) {
         ctx.ui.notify(
@@ -2294,18 +2339,23 @@ Do not modify any code. This is a publish-only step.`;
       let target: ReviewTarget | null = null;
       let fromSelector = false;
       const parsed = parseArgs(args);
+      // Headless flags: an arg-supplied destination lets us skip the
+      // interactive destination picker; --empty forces a fresh session.
+      const argDestination = parsed?.destination;
+      const forceEmpty = parsed?.empty ?? false;
 
       if (parsed) {
-        if (parsed.type === "pr") {
-          target = await handlePrCheckout(ctx, parsed.ref);
+        const t = parsed.target;
+        if (t.type === "pr") {
+          target = await handlePrCheckout(ctx, t.ref);
           if (!target) {
             ctx.ui.notify(
               "PR review failed. Returning to review menu.",
               "warning",
             );
           }
-        } else if (parsed.type === "worktreeCli") {
-          target = await handleWorktreeCli(ctx, parsed.ref, parsed.base);
+        } else if (t.type === "worktreeCli") {
+          target = await handleWorktreeCli(ctx, t.ref, t.base);
           if (!target) {
             ctx.ui.notify(
               "Worktree review failed. Returning to review menu.",
@@ -2313,7 +2363,28 @@ Do not modify any code. This is a publish-only step.`;
             );
           }
         } else {
-          target = parsed;
+          target = t;
+        }
+      }
+
+      // Headless mode: with no interactive UI the invocation must be fully
+      // specified (resolved target + destination), or we'd block on a prompt
+      // that can't be answered. Guard per-need rather than refusing all
+      // headless runs.
+      if (!ctx.hasUI) {
+        if (!target) {
+          ctx.ui.notify(
+            "Headless /review needs a target, e.g. `/review pr <number> github --empty`",
+            "error",
+          );
+          return;
+        }
+        if (!argDestination) {
+          ctx.ui.notify(
+            "Headless /review needs a destination arg (github|claude|pi|none), e.g. `/review pr <number> github --empty`",
+            "error",
+          );
+          return;
         }
       }
 
@@ -2338,9 +2409,10 @@ Do not modify any code. This is a publish-only step.`;
         const messageCount = entries.filter((e) => e.type === "message").length;
 
         // In an empty session, default to fresh review mode so /end-review works consistently.
-        let useFreshSession = messageCount === 0;
+        // --empty forces fresh and skips the prompt entirely (required for headless).
+        let useFreshSession = messageCount === 0 || forceEmpty;
 
-        if (messageCount > 0) {
+        if (messageCount > 0 && !forceEmpty) {
           // Existing session - ask user which mode they want
           const choice = await ctx.ui.select("Start review in:", [
             "Empty branch",
@@ -2359,7 +2431,8 @@ Do not modify any code. This is a publish-only step.`;
           useFreshSession = choice === "Empty branch";
         }
 
-        const destination = await askReviewDestination(ctx);
+        // Use the arg-supplied destination when present; otherwise ask.
+        const destination = argDestination ?? (await askReviewDestination(ctx));
         if (destination === null) {
           if (fromSelector) {
             target = null;
@@ -2370,7 +2443,9 @@ Do not modify any code. This is a publish-only step.`;
         }
         setReviewDestination(destination);
 
-        await executeReview(ctx, target, useFreshSession);
+        await executeReview(ctx, target, useFreshSession, {
+          headless: !ctx.hasUI,
+        });
         return;
       }
     },
